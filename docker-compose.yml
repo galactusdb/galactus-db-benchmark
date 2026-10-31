@@ -1,0 +1,73 @@
+# Galactus DB, Neo4j and Memgraph, each under the same CPU and memory limits.
+#
+# bench.py starts one service at a time on a fresh volume, so the engines never
+# compete for the machine. Every engine runs its Community edition with its own
+# defaults; the only settings changed are listed and explained below.
+#
+#   python bench.py            # runs everything, see README.md
+#
+# Limits come from the environment (or .env): BENCH_CPUS and BENCH_MEM.
+
+x-limits: &limits
+  cpus: ${BENCH_CPUS:-8}
+  mem_limit: ${BENCH_MEM:-4g}
+  memswap_limit: ${BENCH_MEM:-4g}
+
+services:
+  # Galactus DB with the Paged engine (the default): pages in use are held in
+  # memory inside one budget, and the database opens straight from disk.
+  gdb-paged:
+    <<: *limits
+    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.7}
+    profiles: [gdb-paged]
+    environment:
+      GDB_INITIAL_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}
+      GDB_STORAGE_ENGINE: paged
+    ports: ["27687:7687"]
+    volumes: [gdb-paged-data:/data]
+
+  # Galactus DB with the Resident engine: the whole graph in memory, the
+  # like-for-like engine for Memgraph. Everything else is the image default.
+  gdb-resident:
+    <<: *limits
+    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.7}
+    profiles: [gdb-resident]
+    environment:
+      GDB_INITIAL_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}
+      GDB_STORAGE_ENGINE: resident
+    ports: ["27690:7687"]
+    volumes: [gdb-resident-data:/data]
+
+  neo4j:
+    <<: *limits
+    image: neo4j:${NEO4J_TAG:-5.26-community}
+    profiles: [neo4j]
+    environment:
+      NEO4J_AUTH: neo4j/${BENCH_PASSWORD:-benchmark-password-1}
+      # The values `neo4j-admin server memory-recommendation --memory=4g --docker`
+      # prints for a 4 GB machine, so the JVM is sized the way Neo4j advises
+      # rather than guessing inside the container limit.
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2g}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
+      # Graph Data Science Community, for the weighted shortest path.
+      NEO4J_PLUGINS: '["graph-data-science"]'
+    ports: ["27688:7687"]
+    volumes: [neo4j-data:/data]
+
+  memgraph:
+    <<: *limits
+    image: memgraph/memgraph:${MEMGRAPH_TAG:-3.14.0}
+    profiles: [memgraph]
+    # Defaults are left in place (in-memory transactional storage, write-ahead
+    # log, periodic snapshots). Telemetry is switched off so the benchmark
+    # machine sends nothing out; it does not affect the workload.
+    command: ["--telemetry-enabled=false"]
+    ports: ["27689:7687"]
+    volumes: [memgraph-data:/var/lib/memgraph]
+
+volumes:
+  gdb-paged-data:
+  gdb-resident-data:
+  neo4j-data:
+  memgraph-data:
