@@ -10,7 +10,7 @@ Usage:
   python bench.py --engines gdb-resident,memgraph --passes 1
   python bench.py --scale 10000 --passes 1 --smoke   # quick check that it all runs
 
-Results go to results/<timestamp>/ (or --out <folder>/<timestamp>/):
+Results go to runs/<timestamp>/ (or --out <folder>/<timestamp>/):
   environment.json  host, Docker, images, limits and each server's effective settings
   raw.jsonl         every measurement as it was taken
   results.csv       one row per pass, engine, workload and metric
@@ -550,8 +550,8 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="few samples: prove every statement runs")
     ap.add_argument("--profiles", default="standard,restricted",
                     help="limit profiles to run: standard (8 CPUs, 4 GB), restricted (2 CPUs, 1 GB)")
-    ap.add_argument("--out", default=os.environ.get("BENCH_RESULTS", str(HERE / "results")),
-                    help="folder for results (default results/, or BENCH_RESULTS)")
+    ap.add_argument("--out", default=os.environ.get("BENCH_RESULTS", str(HERE / "runs")),
+                    help="folder for results (default runs/, or BENCH_RESULTS)")
     ap.add_argument("--workloads", type=lambda v: v.split(","),
                     help="run only these workloads (comma-separated): " + ", ".join(WORKLOADS))
     ap.add_argument("--into", help="an earlier run folder: replace these engines' results for these "

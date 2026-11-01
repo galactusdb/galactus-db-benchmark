@@ -7,7 +7,7 @@ and builds a single HTML page of charts.
 ```sh
 pip install -r requirements.txt
 python bench.py          # about 30 minutes for both profiles
-python report.py         # writes results/<run>/report.html
+python report.py         # writes runs/<run>/report.html
 ```
 
 You need Docker with Compose and Python 3.9 or later. The first run pulls the images:
@@ -86,7 +86,16 @@ python bench.py --profiles restricted              # one profile
 python bench.py --engines gdb-resident,memgraph    # some engines
 python bench.py --scale 1000000 --passes 5         # a larger graph, more passes
 python bench.py --scale 10000 --passes 1 --smoke   # check it all runs, in a few minutes
-python bench.py --out D:/benchmark/runs            # results somewhere other than results/
+python bench.py --out D:/benchmark/runs            # results somewhere other than runs/
+```
+
+To re-measure some workloads in an earlier run, for example after a new release of
+one engine, name the workloads and the run. The earlier results for those engines
+and workloads are replaced, the rest are kept, and the report states which image
+re-measured them and when.
+
+```sh
+python bench.py --engines gdb-paged,gdb-resident --workloads weighted_shortest_path --into runs/<run>
 ```
 
 Image versions are pinned in `docker-compose.yml` and can be changed with
@@ -94,7 +103,7 @@ Image versions are pinned in `docker-compose.yml` and can be changed with
 
 ## Output
 
-Each run writes `results/<timestamp>/<profile>/`:
+Each run writes `runs/<timestamp>/<profile>/`:
 
 | File | Contents |
 |---|---|

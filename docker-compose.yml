@@ -18,7 +18,7 @@ services:
   # memory inside one budget, and the database opens straight from disk.
   gdb-paged:
     <<: *limits
-    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.7}
+    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.8}
     profiles: [gdb-paged]
     environment:
       GDB_INITIAL_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}
@@ -30,7 +30,7 @@ services:
   # like-for-like engine for Memgraph. Everything else is the image default.
   gdb-resident:
     <<: *limits
-    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.7}
+    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.8}
     profiles: [gdb-resident]
     environment:
       GDB_INITIAL_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}

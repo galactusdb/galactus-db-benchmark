@@ -1,8 +1,8 @@
 """Builds report.html, one self-contained page, from a bench.py results folder.
 
 Usage:
-  python report.py                       # newest folder under results/
-  python report.py results/2026-10-31_101500
+  python report.py                       # newest folder under runs/
+  python report.py runs/2026-10-31_101500
 """
 import csv
 import datetime as dt
@@ -252,7 +252,7 @@ document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',
 
 
 def main():
-    root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else max((HERE / "results").iterdir())
+    root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else max((HERE / "runs").iterdir())
     profiles = [p for p in ("standard", "restricted") if (root / p / "summary.csv").exists()]
     if not profiles:
         raise SystemExit(f"no results in {root}")
