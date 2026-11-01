@@ -78,6 +78,7 @@ python bench.py --profiles restricted              # one profile
 python bench.py --engines gdb-resident,memgraph    # some engines
 python bench.py --scale 1000000 --passes 5         # a larger graph, more passes
 python bench.py --scale 10000 --passes 1 --smoke   # check it all runs, in a few minutes
+python bench.py --out D:/benchmark/runs            # results somewhere other than results/
 ```
 
 Image versions are pinned in `docker-compose.yml` and can be changed with
