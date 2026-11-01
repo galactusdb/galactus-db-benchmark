@@ -125,6 +125,13 @@ def profile_section(name, folder, first):
            f'Graph: {env["params"]["scale"]:,} people, each knowing two others. '
            f'Medians of {env["params"]["passes"]} pass{"" if env["params"]["passes"] == 1 else "es"}, '
            f'each on a fresh volume.</p>']
+    for e in engines:
+        for m in env["engines"][e].get("remeasured", []):
+            titles = [t for _, cs in SECTIONS for w, _, t, _ in cs if w in m["workloads"]]
+            out.append(f'<p class="limits">{html.escape(labels[e])}: {html.escape(", ".join(titles))} '
+                       f're-measured on {started(m["at"])} with <code>{html.escape(m["image"]["image"])}</code> '
+                       f'({html.escape(str(m["server"].get("version", "")))}), {m["passes"]} passes, '
+                       f'same limits and graph. Every other result is from the run above.</p>')
     for heading, charts in SECTIONS:
         cards = "".join(chart(engines, labels, summary, failures, agreed, checked, *c,
                              passes=env["params"]["passes"]) for c in charts)

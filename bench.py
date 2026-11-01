@@ -205,11 +205,18 @@ class MemPeak(threading.Thread):
         self.join(timeout=5)
 
 
+WORKLOADS = ("bulk_load", "memory", "index_seek", "two_hop", "filtered_scan", "shortest_path",
+             "all_shortest_paths", "weighted_shortest_path", "concurrent_read", "restart")
+
+
 class Run:
     """One engine, one pass: start fresh, load, measure, restart, stop."""
 
     def __init__(self, engine, args, pass_no, sink):
-        self.engine, self.cfg, self.a, self.pass_no, self.sink = engine, ENGINES[engine], args, pass_no, sink
+        self.engine, self.cfg, self.a, self.pass_no = engine, ENGINES[engine], args, pass_no
+        self.keep = set(getattr(args, "workloads", None) or WORKLOADS)
+        # Only the selected workloads are recorded; the graph is always loaded first.
+        self.sink = lambda row: sink(row) if row.get("workload") in self.keep else None
         self.rows = []
 
     # -- plumbing -----------------------------------------------------------
@@ -227,7 +234,8 @@ class Run:
     def metric(self, workload, metric, value, unit, better, **extra):
         row = {"pass": self.pass_no, "engine": self.engine, "workload": workload,
                "metric": metric, "value": value, "unit": unit, "better": better}
-        self.rows.append(row)
+        if workload in self.keep:
+            self.rows.append(row)
         self.sink({**row, **extra})
         print(f"  {self.engine:13s} {workload:22s} {metric:16s} {value:12,.2f} {unit}")
 
@@ -435,8 +443,9 @@ class Run:
             del self.rows[kept:]  # a failed workload has no measurements, only the failure
             st = self.state()
             reason = "out of memory (killed)" if st["oom_killed"] else f"{type(e).__name__}: {str(e)[:200]}"
-            self.rows.append({"pass": self.pass_no, "engine": self.engine, "workload": workload,
-                              "metric": "did_not_finish", "value": 1, "unit": reason, "better": "lower"})
+            if workload in self.keep:
+                self.rows.append({"pass": self.pass_no, "engine": self.engine, "workload": workload,
+                                  "metric": "did_not_finish", "value": 1, "unit": reason, "better": "lower"})
             self.sink({"pass": self.pass_no, "engine": self.engine, "workload": workload,
                        "kind": "failure", "reason": reason, "state": st})
             print(f"  {self.engine:13s} {workload:22s} DID NOT FINISH: {reason}")
@@ -453,10 +462,11 @@ class Run:
         self.start()
         try:
             self.attempt("bulk_load", self.bulk_load)
-            self.attempt("memory", lambda: self.idle_memory(settle=2 if self.a.smoke else 15))
-            for name in ("index_seek", "two_hop", "filtered_scan", "shortest_path", "all_shortest_paths",
-                         "weighted_shortest_path", "concurrent_read", "restart"):
-                self.attempt(name, getattr(self, name))
+            if "memory" in self.keep:
+                self.attempt("memory", lambda: self.idle_memory(settle=2 if self.a.smoke else 15))
+            for name in WORKLOADS[2:]:
+                if name in self.keep:
+                    self.attempt(name, getattr(self, name))
         finally:
             self.stop()
         return self.rows
@@ -542,20 +552,28 @@ def main():
                     help="limit profiles to run: standard (8 CPUs, 4 GB), restricted (2 CPUs, 1 GB)")
     ap.add_argument("--out", default=os.environ.get("BENCH_RESULTS", str(HERE / "results")),
                     help="folder for results (default results/, or BENCH_RESULTS)")
+    ap.add_argument("--workloads", type=lambda v: v.split(","),
+                    help="run only these workloads (comma-separated): " + ", ".join(WORKLOADS))
+    ap.add_argument("--into", help="an earlier run folder: replace these engines' results for these "
+                                   "workloads in it, and record which image re-measured them")
     a = ap.parse_args()
+    for wl in a.workloads or ():
+        if wl not in WORKLOADS:
+            raise SystemExit(f"unknown workload {wl!r}; choose from {', '.join(WORKLOADS)}")
     engines = a.engines.split(",")
     for e in engines:
         if e not in ENGINES:
             raise SystemExit(f"unknown engine {e!r}; choose from {', '.join(ENGINES)}")
 
-    stamp = pathlib.Path(a.out) / dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    stamp = (pathlib.Path(a.into) if a.into
+             else pathlib.Path(a.out) / dt.datetime.now().strftime("%Y-%m-%d_%H%M%S"))
     for profile in a.profiles.split(","):
         if profile not in PROFILES:
             raise SystemExit(f"unknown profile {profile!r}; choose from {', '.join(PROFILES)}")
         LIMITS.clear()
         LIMITS.update(PROFILES[profile])
         print(f"\n#### {profile}: {LIMITS['BENCH_CPUS']} CPUs, {LIMITS['BENCH_MEM']} memory per engine")
-        run_profile(a, engines, profile, stamp / profile)
+        (merge_profile if a.into else run_profile)(a, engines, profile, stamp / profile)
     print(f"\nResults: {stamp}\nNext: python report.py {stamp}")
 
 
@@ -583,20 +601,7 @@ def run_profile(a, engines, profile, out):
             print(f"== pass {p}: {e}")
             run = Run(e, a, p, sink)
             if e not in env["engines"]:
-                # Record the exact image, limits and server settings once, from the live server.
-                run.start()
-                cid = run.container
-                hc = json.loads(sh("docker", "inspect", cid))[0]["HostConfig"]
-                env["engines"][e] = {
-                    "label": ENGINES[e]["label"],
-                    "image": image_facts(json.loads(sh("docker", "inspect", cid))[0]["Config"]["Image"]),
-                    "limits": {"cpus": hc["NanoCpus"] / 1e9, "memory_bytes": hc["Memory"]},
-                    "server": server_facts(e),
-                    "setup": ENGINES[e]["setup"], "schema": ENGINES[e]["schema"],
-                    "statements": {k: run.q(k) for k in ("Q_CREATE_NODES", "Q_CREATE_RELS", "Q_SEEK", "Q_TWO_HOP",
-                                                         "Q_SCAN", "Q_SP", "Q_ASP", "Q_PROJECT", "Q_WSP")},
-                }
-                run.stop()
+                env["engines"][e] = engine_facts(run)
             rows += run.all()
     raw.close()
 
@@ -605,7 +610,76 @@ def run_profile(a, engines, profile, out):
     if not env["limits_identical"]:
         print("WARNING: engines ran under different limits:", limits)
     (out / "environment.json").write_text(json.dumps(env, indent=2), encoding="utf-8")
+    write_tables(out, rows)
 
+
+def engine_facts(run):
+    """The exact image, limits and server settings, read once from the live server."""
+    e = run.engine
+    run.start()
+    try:
+        info = json.loads(sh("docker", "inspect", run.container))[0]
+        hc = info["HostConfig"]
+        return {
+            "label": ENGINES[e]["label"],
+            "image": image_facts(info["Config"]["Image"]),
+            "limits": {"cpus": hc["NanoCpus"] / 1e9, "memory_bytes": hc["Memory"]},
+            "server": server_facts(e),
+            "setup": ENGINES[e]["setup"], "schema": ENGINES[e]["schema"],
+            "statements": {k: run.q(k) for k in ("Q_CREATE_NODES", "Q_CREATE_RELS", "Q_SEEK", "Q_TWO_HOP",
+                                                 "Q_SCAN", "Q_SP", "Q_ASP", "Q_PROJECT", "Q_WSP")},
+        }
+    finally:
+        run.stop()
+
+
+def merge_profile(a, engines, profile, out):
+    """Re-measures some workloads for some engines and puts them into an earlier run.
+
+    The earlier rows for those engines and workloads are replaced, every other row is
+    kept, and environment.json records the image, code and date of the re-measurement.
+    """
+    if not (out / "environment.json").exists():
+        raise SystemExit(f"no earlier run in {out}")
+    env = json.loads((out / "environment.json").read_text(encoding="utf-8"))
+    if env["limits"] != LIMITS:
+        raise SystemExit(f"{out} ran under {env['limits']}, not {LIMITS}")
+    workloads = a.workloads or list(WORKLOADS)
+    replaced = {(e, w) for e in engines for w in workloads}
+
+    def kept(r):
+        return (r.get("engine"), r.get("workload")) not in replaced
+
+    with open(out / "results.csv", encoding="utf-8") as f:
+        rows = [{**r, "pass": int(r["pass"]), "value": float(r["value"]) if r["value"] else None}
+                for r in csv.DictReader(f) if kept(r)]
+    raw_lines = [line for line in (out / "raw.jsonl").read_text(encoding="utf-8").splitlines()
+                 if kept(json.loads(line))]
+    with open(out / "raw.jsonl", "w", encoding="utf-8") as raw:
+        raw.writelines(line + "\n" for line in raw_lines)
+
+        def sink(row):
+            raw.write(json.dumps(row) + "\n")
+            raw.flush()
+
+        for e in engines:
+            facts = engine_facts(Run(e, a, 0, sink))
+            if facts["limits"] != env["engines"][e]["limits"]:
+                raise SystemExit(f"{e} limits differ from the earlier run")
+            env["engines"][e].setdefault("remeasured", []).append({
+                "at": dt.datetime.now().isoformat(timespec="seconds"), "workloads": workloads,
+                "passes": a.passes, "image": facts["image"], "server": facts["server"],
+                "bench_sha256": hashlib.sha256((HERE / "bench.py").read_bytes()).hexdigest()})
+        for p in range(1, a.passes + 1):
+            shift = (p - 1) % len(engines)
+            for e in engines[shift:] + engines[:shift]:
+                print(f"== pass {p}: {e} ({', '.join(workloads)})")
+                rows += Run(e, a, p, sink).all()
+    (out / "environment.json").write_text(json.dumps(env, indent=2), encoding="utf-8")
+    write_tables(out, rows)
+
+
+def write_tables(out, rows):
     fields = ["pass", "engine", "workload", "metric", "value", "unit", "better"]
     with open(out / "results.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
