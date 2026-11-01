@@ -131,6 +131,28 @@ def person(i):
     return {"id": i, "name": f"person-{i}", "age": 18 + (i * 7919) % 70, "city": CITIES[i % len(CITIES)]}
 
 
+def knows(n):
+    """The relationships, from a fixed seed: each person knows two others, weight 1 to 10."""
+    rng = random.Random(42)
+    for i in range(n):
+        for _ in range(2):
+            yield {"a": i, "b": rng.randrange(n), "w": rng.randint(1, 10)}
+
+
+_NEIGHBOURS = {}
+
+
+def neighbours(n):
+    """Undirected adjacency of the generated graph, used only to choose path endpoints."""
+    if n not in _NEIGHBOURS:
+        adj = [[] for _ in range(n)]
+        for r in knows(n):
+            adj[r["a"]].append(r["b"])
+            adj[r["b"]].append(r["a"])
+        _NEIGHBOURS[n] = adj
+    return _NEIGHBOURS[n]
+
+
 def pct(xs, p):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1))))] if xs else None
@@ -263,7 +285,6 @@ class Run:
     # -- workloads -------------------------------------------------------------
     def bulk_load(self, batch=1000):
         n = self.a.scale
-        rng = random.Random(42)
         with MemPeak(self.container) as mem, self.session(self.drv) as s:
             t0 = time.perf_counter()
             for start in range(0, n, batch):
@@ -271,9 +292,8 @@ class Run:
             t_nodes = time.perf_counter() - t0
             t1 = time.perf_counter()
             pairs = []
-            for i in range(n):
-                for _ in range(2):
-                    pairs.append({"a": i, "b": rng.randrange(n), "w": rng.randint(1, 10)})
+            for r in knows(n):
+                pairs.append(r)
                 if len(pairs) >= batch:
                     s.run(self.q("Q_CREATE_RELS"), pairs=pairs).consume()
                     pairs = []
@@ -292,6 +312,19 @@ class Run:
         rng = random.Random(f"{self.a.seed}-{salt}")
         return [{"a": rng.randrange(self.a.scale), "b": rng.randrange(self.a.scale)} for _ in range(count)]
 
+    def linked_pairs(self, salt, count):
+        """Pairs with a path of at most 6 hops between them: a random walk of 2 to 6 steps
+        from a random person. Random pairs in a sparse graph are rarely within 6 hops, and a
+        search that finds nothing is not the work these tests are about."""
+        rng, adj, out = random.Random(f"{self.a.seed}-{salt}"), neighbours(self.a.scale), []
+        while len(out) < count:
+            a = b = rng.randrange(self.a.scale)
+            for _ in range(rng.randint(2, 6)):
+                b = rng.choice(adj[b])
+            if b != a:
+                out.append({"a": a, "b": b})
+        return out
+
     def ids(self, salt, count):
         rng = random.Random(f"{self.a.seed}-{salt}")
         return [{"id": rng.randrange(self.a.scale)} for _ in range(count)]
@@ -309,11 +342,11 @@ class Run:
                      lambda r: r[0]["c"] if r else None, warm=2)
 
     def shortest_path(self):
-        self.latency("shortest_path", self.q("Q_SP"), self.pairs("sp", self.k(100) + 10),
+        self.latency("shortest_path", self.q("Q_SP"), self.linked_pairs("sp", self.k(100) + 10),
                      lambda r: r[0]["hops"] if r else None, warm=10)
 
     def all_shortest_paths(self):
-        self.latency("all_shortest_paths", self.q("Q_ASP"), self.pairs("asp", self.k(100) + 10),
+        self.latency("all_shortest_paths", self.q("Q_ASP"), self.linked_pairs("asp", self.k(100) + 10),
                      lambda r: [r[0]["hops"], r[0]["paths"]] if r else None, warm=10)
 
     def weighted_shortest_path(self):
@@ -332,15 +365,20 @@ class Run:
     def concurrent_read(self):
         clients, seconds = self.a.clients, self.a.seconds
         counts, lats, stop = [0] * clients, [[] for _ in range(clients)], threading.Event()
+        errors = []
 
         def worker(k):
             rng = random.Random(f"{self.a.seed}-read-{k}")
-            with self.session(self.drv) as s:
-                while not stop.is_set():
-                    t0 = time.perf_counter()
-                    s.run(self.q("Q_SEEK"), id=rng.randrange(self.a.scale)).consume()
-                    lats[k].append((time.perf_counter() - t0) * 1000)
-                    counts[k] += 1
+            try:
+                with self.session(self.drv) as s:
+                    while not stop.is_set():
+                        t0 = time.perf_counter()
+                        s.run(self.q("Q_SEEK"), id=rng.randrange(self.a.scale)).consume()
+                        lats[k].append((time.perf_counter() - t0) * 1000)
+                        counts[k] += 1
+            except Exception as e:
+                errors.append(e)
+                stop.set()
 
         threads = [threading.Thread(target=worker, args=(k,)) for k in range(clients)]
         with MemPeak(self.container) as mem:
@@ -352,6 +390,8 @@ class Run:
             for t in threads:
                 t.join()
             elapsed = time.perf_counter() - t0
+        if errors:
+            raise errors[0]
         flat = [x for l in lats for x in l]
         self.metric("concurrent_read", "reads_per_s", sum(counts) / elapsed, "reads/s", "higher", clients=clients)
         self.metric("concurrent_read", "p50_ms", pct(flat, 50), "ms", "lower")
@@ -388,9 +428,11 @@ class Run:
 
     def attempt(self, workload, fn):
         """Runs one workload. A failure is recorded as "did not finish" and the run goes on."""
+        kept = len(self.rows)
         try:
             fn()
         except Exception as e:  # an engine running out of memory is a result, not a crash of the suite
+            del self.rows[kept:]  # a failed workload has no measurements, only the failure
             st = self.state()
             reason = "out of memory (killed)" if st["oom_killed"] else f"{type(e).__name__}: {str(e)[:200]}"
             self.rows.append({"pass": self.pass_no, "engine": self.engine, "workload": workload,
@@ -570,8 +612,12 @@ def run_profile(a, engines, profile, out):
         w.writeheader()
         w.writerows(rows)
 
+    # A workload that failed in any pass has no median: the report shows it as did not finish.
+    failed = {(r["engine"], r["workload"]) for r in rows if r["metric"] == "did_not_finish"}
     groups = {}
     for r in rows:
+        if (r["engine"], r["workload"]) in failed:
+            continue
         groups.setdefault((r["engine"], r["workload"], r["metric"], r["unit"], r["better"]), []).append(r["value"])
     with open(out / "summary.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)

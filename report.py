@@ -19,8 +19,8 @@ PROFILE_NAMES = {"standard": "Standard", "restricted": "Restricted"}
 # Each chart: (workload, metric, title, what it measures).
 SECTIONS = [
     ("Shortest paths", [
-        ("shortest_path", "p50_ms", "Shortest path", "Fewest hops between two random people, up to 6 hops. Median latency."),
-        ("all_shortest_paths", "p50_ms", "All shortest paths", "Every equally short path between two random people, up to 6 hops. Median latency."),
+        ("shortest_path", "p50_ms", "Shortest path", "Fewest hops between two people up to 6 hops apart. Median latency."),
+        ("all_shortest_paths", "p50_ms", "All shortest paths", "Every equally short path between two people up to 6 hops apart. Median latency."),
         ("weighted_shortest_path", "p50_ms", "Weighted shortest path", "Lowest total weight between two random people (Dijkstra). Median latency."),
     ]),
     ("Lookups and traversals", [
@@ -78,7 +78,7 @@ def load_profile(folder):
     return env, summary, agreed, failures, {w for (w, _) in answers}
 
 
-def chart(engines, labels, summary, failures, agreed, checked, workload, metric, title, note):
+def chart(engines, labels, summary, failures, agreed, checked, workload, metric, title, note, passes=1):
     rows = [(e, summary.get((e, workload, metric))) for e in engines]
     have = [r for _, r in rows if r]
     if not have and not any(failures.get((e, workload)) for e in engines):
@@ -91,9 +91,10 @@ def chart(engines, labels, summary, failures, agreed, checked, workload, metric,
     for i, (e, r) in enumerate(rows):
         slot = ENGINE_ORDER.index(e) + 1
         if r is None or r["passes"] == "0":
-            reason = (failures.get((e, workload)) or ["not measured"])[0]
+            failed = failures.get((e, workload)) or ["not measured"]
+            times = f" in {len(failed)} of {passes} passes" if failures.get((e, workload)) else ""
             bars.append(f'<div class="bar-row"><span class="bar-name">{html.escape(labels[e])}</span>'
-                        f'<span class="dnf">Did not finish: {html.escape(reason)}</span></div>')
+                        f'<span class="dnf">Did not finish{times}: {html.escape(failed[0])}</span></div>')
             continue
         width = max(0.6, 100 * r["median"] / top)
         tip = (f'{labels[e]}: {fmt(r["median"], unit)} median of {r["passes"]} passes '
@@ -125,7 +126,8 @@ def profile_section(name, folder, first):
            f'Medians of {env["params"]["passes"]} pass{"" if env["params"]["passes"] == 1 else "es"}, '
            f'each on a fresh volume.</p>']
     for heading, charts in SECTIONS:
-        cards = "".join(chart(engines, labels, summary, failures, agreed, checked, *c) for c in charts)
+        cards = "".join(chart(engines, labels, summary, failures, agreed, checked, *c,
+                             passes=env["params"]["passes"]) for c in charts)
         if cards:
             out.append(f'<h3>{heading}</h3><div class="grid">{cards}</div>')
     # Image size is a property of the image, not a measurement of the run.

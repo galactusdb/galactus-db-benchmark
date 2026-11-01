@@ -55,8 +55,8 @@ defaults, including buffered durability with a 50 ms commit-log sync.
 
 | Group | Workload | Metric |
 |---|---|---|
-| Shortest paths | Shortest path between two random people, up to 6 hops | median latency |
-| | All shortest paths between two random people, up to 6 hops | median latency |
+| Shortest paths | Shortest path between two people up to 6 hops apart | median latency |
+| | All shortest paths between two people up to 6 hops apart | median latency |
 | | Weighted shortest path (Dijkstra) between two random people | median latency |
 | Lookups and traversals | Index lookup by id | median latency |
 | | Distinct friends of friends | median latency |
@@ -65,6 +65,14 @@ defaults, including buffered durability with a 50 ms commit-log sync.
 | Loading | People and relationships created in batches of 1,000 | per second |
 | Memory | Peak while loading, at rest with the graph loaded, peak under concurrent reads | MB |
 | Start-up | Clean stop, then `docker start` to the first correct answer | seconds |
+
+For the two unweighted path tests, each pair is chosen by a random walk of 2 to 6
+steps from a random person, so a path always exists within the 6-hop limit; random
+pairs in a graph this sparse are almost never that close. Weighted paths have no
+hop limit, so they use two random people.
+
+A workload that fails in any pass is shown as did not finish, with the number of
+passes it failed in, rather than as a median of the passes that completed.
 
 Memgraph has no `shortestPath()`, `allShortestPaths()` or Graph Data Science
 procedures, so it runs its own built-in equivalents (`*BFS`, `*ALLSHORTEST` and
