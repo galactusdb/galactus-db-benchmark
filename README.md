@@ -1,17 +1,18 @@
 # Graph database benchmark
 
-Galactus DB, Neo4j and Memgraph, measured side by side on your own machine. One
+Galactus DB, Neo4j, Memgraph and FalkorDB, measured side by side on your own machine. One
 command runs every engine through the same workloads, writes the results as CSV
 and builds a single HTML page of charts.
 
 ```sh
 pip install -r requirements.txt
-python bench.py          # about 30 minutes for both profiles
+python bench.py          # under an hour for both profiles
 python report.py         # writes runs/<run>/report.html
 ```
 
 You need Docker with Compose and Python 3.9 or later. The first run pulls the images:
-Galactus DB, Neo4j Community (with the Graph Data Science plugin) and Memgraph Community.
+Galactus DB, Neo4j Community (with the Graph Data Science plugin), Memgraph Community
+and FalkorDB.
 
 ## How the comparison is kept fair
 
@@ -30,14 +31,37 @@ Galactus DB, Neo4j Community (with the Graph Data Science plugin) and Memgraph C
   listed in `docker-compose.yml` with the reason beside each: Neo4j's heap and
   page cache are the values `neo4j-admin server memory-recommendation` prints
   for each memory limit, Neo4j loads the Graph Data Science plugin for weighted
-  paths, and Memgraph's telemetry is off. Each server's effective settings are
-  read back from the running server and printed in the report.
-- **Same client, same data, same Cypher.** One Python process drives every
-  engine through the official Neo4j Python driver. The graph is generated from
-  a fixed seed: 100,000 people, each knowing two others, with a weight of 1 to
-  10 on every relationship. Every engine runs the same statement text wherever
-  it accepts it. The differences are all in one place, `ENGINES` in `bench.py`,
-  and the report lists every statement each engine ran.
+  paths, and Memgraph's telemetry is off. FalkorDB runs its server image as it
+  comes, without the image's 1 second query timeout so that every query can
+  finish. Each server's effective settings are read back from the running
+  server and printed in the report.
+- **Same data, same Cypher.** The graph is generated from a fixed seed: 100,000
+  people, each knowing two others, with a weight of 1 to 10 on every
+  relationship. Every engine runs the same statement text wherever it accepts
+  it. The differences are all in one place, `ENGINES` in `bench.py`, and the
+  report lists every statement each engine ran.
+- **Like-for-like clients.** One Python process drives every engine. Galactus
+  DB, Neo4j and Memgraph speak Bolt and share the official Neo4j Python driver.
+  FalkorDB is a Redis module, so it is driven over the Redis protocol by a small
+  client in `bench.py` that sends what FalkorDB's own clients send. A client
+  library's work is part of every latency it measures, and the Neo4j driver does
+  far more per query than a Redis client, so to compare engines across the two
+  protocols run with `--client minimal`: every engine is then driven by a small
+  client that only sends the statement and reads the rows.
+- **The client beside the engine.** With `--inside`, the timed queries are sent
+  from a container on the engine's own Docker network, using the minimal
+  clients. On Docker Desktop a query from the host crosses a forwarded port,
+  which costs every engine the same few tenths of a millisecond and hides the
+  differences between fast queries. The report shows what an empty query costs
+  each engine, so you can see how much of any latency is the path and not the
+  engine.
+- **Clients that do not queue.** In the concurrent test each of the 16 clients
+  is its own process with its own connection, so the test measures the engine
+  and not one Python interpreter.
+- **Like-for-like durability.** Galactus DB, Neo4j and Memgraph log every write
+  to disk by default. FalkorDB keeps writes in memory between snapshots unless
+  Redis's append-only file is on, so it runs twice: as it comes (`falkordb`),
+  and with the append-only file on (`falkordb-aof`).
 - **The same answers.** Every timed query's answer is fingerprinted, and the
   report shows whether all engines returned the same results.
 - **Warm-up, then medians.** Each latency test runs a few untimed queries
@@ -48,7 +72,7 @@ Galactus DB, Neo4j Community (with the Graph Data Science plugin) and Memgraph C
 
 Galactus DB runs twice: **Paged**, its default engine, which keeps the pages in
 use in memory and opens straight from disk, and **Resident**, which keeps the
-whole graph in memory as Memgraph does. Both run the published image with its
+whole graph in memory as Memgraph and FalkorDB do. Both run the published image with its
 defaults, including buffered durability with a 50 ms commit-log sync.
 
 ## What is measured
@@ -58,7 +82,9 @@ defaults, including buffered durability with a 50 ms commit-log sync.
 | Shortest paths | Shortest path between two people up to 6 hops apart | median latency |
 | | All shortest paths between two people up to 6 hops apart | median latency |
 | | Weighted shortest path (Dijkstra) between two random people | median latency |
-| Lookups and traversals | Index lookup by id | median latency |
+| | Building the projection a weighted search runs on, where an engine uses one | once, in ms |
+| Lookups and traversals | An empty query, `RETURN 1` | median latency |
+| | Index lookup by id | median latency |
 | | Distinct friends of friends | median latency |
 | | Count of people matching a predicate on an unindexed property | median latency |
 | | Index lookups from 16 concurrent clients | reads per second |
@@ -72,18 +98,26 @@ pairs in a graph this sparse are almost never that close. Weighted paths have no
 hop limit, so they use two random people.
 
 A workload that fails in any pass is shown as did not finish, with the number of
-passes it failed in, rather than as a median of the passes that completed.
+passes it failed in, rather than as a median of the passes that completed. If the
+graph itself does not load, the rest of that pass is recorded as did not finish
+too: nothing timed on part of a graph is a measurement of it.
 
 Memgraph has no `shortestPath()`, `allShortestPaths()` or Graph Data Science
 procedures, so it runs its own built-in equivalents (`*BFS`, `*ALLSHORTEST` and
 `*WSHORTEST`), which return the same answers. Neo4j and Galactus DB run the same
 Graph Data Science call for weighted paths, from a projection built once.
 
+FalkorDB takes `shortestPath()` in a `WITH` clause and `allShortestPaths()` once
+both ends are bound, so those two statements are reworded for it, and it answers
+weighted paths with its own `algo.SPpaths` procedure.
+
 ## Options
 
 ```sh
 python bench.py --profiles restricted              # one profile
 python bench.py --engines gdb-resident,memgraph    # some engines
+python bench.py --client minimal                   # minimal clients for every engine
+python bench.py --inside                           # and the client beside each engine
 python bench.py --scale 1000000 --passes 5         # a larger graph, more passes
 python bench.py --scale 10000 --passes 1 --smoke   # check it all runs, in a few minutes
 python bench.py --out D:/benchmark/runs            # results somewhere other than runs/
@@ -99,7 +133,10 @@ python bench.py --engines gdb-paged,gdb-resident --workloads weighted_shortest_p
 ```
 
 Image versions are pinned in `docker-compose.yml` and can be changed with
-`GALACTUS_TAG`, `NEO4J_TAG` and `MEMGRAPH_TAG`.
+`GALACTUS_TAG`, `NEO4J_TAG`, `MEMGRAPH_TAG` and `FALKORDB_TAG`; the client
+container's image is `BENCH_CLIENT_IMAGE`. If a host port is taken on your
+machine, set `BENCH_PORT_` and the engine's name, as in
+`BENCH_PORT_GDB_RESIDENT`.
 
 ## Output
 

@@ -1,14 +1,16 @@
-"""Galactus DB, Neo4j and Memgraph, measured side by side.
+"""Galactus DB, Neo4j, Memgraph and FalkorDB, measured side by side.
 
 Every engine gets the same machine, the same CPU and memory limits, the same
-synthetic graph, the same Python Bolt driver and the same Cypher text wherever
-the engines accept it. Engines run one at a time on a fresh volume, and the
-order rotates each pass so none always goes first or last.
+synthetic graph and the same Cypher text wherever the engines accept it. The
+Bolt engines share one Python Bolt driver; FalkorDB is driven over its own
+Redis protocol. Engines run one at a time on a fresh volume, and the order
+rotates each pass so none always goes first or last.
 
 Usage:
   python bench.py                        # all engines, 100,000 people, 3 passes
   python bench.py --engines gdb-resident,memgraph --passes 1
   python bench.py --scale 10000 --passes 1 --smoke   # quick check that it all runs
+  python bench.py --inside               # the client beside each engine, on its Docker network
 
 Results go to runs/<timestamp>/ (or --out <folder>/<timestamp>/):
   environment.json  host, Docker, images, limits and each server's effective settings
@@ -22,27 +24,33 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import multiprocessing
 import os
 import pathlib
 import platform
 import random
 import re
+import socket
 import statistics
+import struct
 import subprocess
+import sys
 import threading
 import time
 
-import neo4j
-from neo4j import GraphDatabase
-
-# The official Python driver only talks to servers whose Bolt agent starts with
-# "Neo4j/". Galactus DB reports "GDB/<version>", so switch off that one check.
-# The wire protocol is unchanged, and the patch applies to every engine alike.
-import neo4j._sync.io as _neo4j_io  # noqa: E402
-
-for _mod in (_neo4j_io, _neo4j_io._bolt3, _neo4j_io._bolt4, _neo4j_io._bolt5, _neo4j_io._common):
-    if hasattr(_mod, "check_supported_server_product"):
-        _mod.check_supported_server_product = lambda agent: None
+try:  # only --client driver needs it; the client container runs without it
+    import neo4j
+    import neo4j._sync.io as _neo4j_io
+    from neo4j import GraphDatabase
+except ImportError:
+    neo4j = GraphDatabase = None
+else:
+    # The official Python driver only talks to servers whose Bolt agent starts with
+    # "Neo4j/". Galactus DB reports "GDB/<version>", so switch off that one check.
+    # The wire protocol is unchanged, and the patch applies to every engine alike.
+    for _mod in (_neo4j_io, _neo4j_io._bolt3, _neo4j_io._bolt4, _neo4j_io._bolt5, _neo4j_io._common):
+        if hasattr(_mod, "check_supported_server_product"):
+            _mod.check_supported_server_product = lambda agent: None
 
 HERE = pathlib.Path(__file__).resolve().parent
 PASSWORD = os.environ.get("BENCH_PASSWORD", "benchmark-password-1")
@@ -75,10 +83,17 @@ Q_WSP = ("MATCH (a:Person {id: $a}), (b:Person {id: $b}) "
          "relationshipWeightProperty: 'w'}) YIELD totalCost RETURN totalCost AS cost")
 Q_READY = "MATCH (p:Person {id: $id}) RETURN p.name AS name"
 
+def port(engine, default):
+    """The host port an engine is published on. If a default is taken on your machine, set
+    BENCH_PORT_ and the engine's name, as in BENCH_PORT_GDB_RESIDENT; docker-compose.yml
+    reads the same variables."""
+    return int(os.environ.get("BENCH_PORT_" + engine.upper().replace("-", "_"), default))
+
+
 ENGINES = {
     "gdb-paged": {
         "label": "Galactus DB (Paged)",
-        "uri": "bolt://127.0.0.1:27687",
+        "port": port("gdb-paged", 27687),
         "user": "gdb",
         "database": "bench",
         "setup": ["CREATE DATABASE bench"],
@@ -86,7 +101,7 @@ ENGINES = {
     },
     "gdb-resident": {
         "label": "Galactus DB (Resident)",
-        "uri": "bolt://127.0.0.1:27690",
+        "port": port("gdb-resident", 27690),
         "user": "gdb",
         "database": "bench",
         "setup": ["CREATE DATABASE bench", "ALTER DATABASE bench SET ENGINE RESIDENT"],
@@ -94,7 +109,7 @@ ENGINES = {
     },
     "neo4j": {
         "label": "Neo4j Community",
-        "uri": "bolt://127.0.0.1:27688",
+        "port": port("neo4j", 27688),
         "user": "neo4j",
         "database": "neo4j",
         "setup": [],
@@ -102,7 +117,7 @@ ENGINES = {
     },
     "memgraph": {
         "label": "Memgraph Community",
-        "uri": "bolt://127.0.0.1:27689",
+        "port": port("memgraph", 27689),
         # Memgraph Community runs without users and with one database.
         "user": None,
         "database": None,
@@ -121,7 +136,37 @@ ENGINES = {
                       "MATCH p = (a)-[:KNOWS *WSHORTEST (r, n | r.w) total]-(b) RETURN total AS cost"),
         },
     },
+    "falkordb": {
+        "label": "FalkorDB",
+        # FalkorDB is a Redis module. It is driven over the Redis protocol with the command its
+        # client libraries send (GRAPH.QUERY ... --compact); see RespSession below.
+        "protocol": "resp",
+        "port": port("falkordb", 26379),
+        # The image runs without a password, and a graph is a named key rather than a database.
+        "user": None,
+        "database": "bench",
+        "setup": [],
+        "schema": ["CREATE INDEX FOR (p:Person) ON (p.id)"],
+        # FalkorDB takes shortestPath() in WITH or RETURN and allShortestPaths() once both ends
+        # are bound, and answers weighted paths with its own algo.SPpaths procedure.
+        "queries": {
+            "Q_SP": ("MATCH (a:Person {id: $a}), (b:Person {id: $b}) "
+                     "WITH shortestPath((a)-[:KNOWS*..6]-(b)) AS p RETURN length(p) AS hops"),
+            "Q_ASP": ("MATCH (a:Person {id: $a}), (b:Person {id: $b}) WITH a, b "
+                      "MATCH p = allShortestPaths((a)-[:KNOWS*..6]-(b)) "
+                      "RETURN length(p) AS hops, count(p) AS paths"),
+            "Q_PROJECT": None,
+            "Q_WSP": ("MATCH (a:Person {id: $a}), (b:Person {id: $b}) "
+                      "CALL algo.SPpaths({sourceNode: a, targetNode: b, relTypes: ['KNOWS'], "
+                      "relDirection: 'both', weightProp: 'w'}) YIELD pathWeight RETURN pathWeight AS cost"),
+        },
+    },
 }
+# FalkorDB keeps writes in memory between snapshots unless Redis's append-only file is on.
+# This is the same server with that file on, so every write reaches a log on disk, as it
+# does in the other engines. Only loading and restarting differ from the entry above.
+ENGINES["falkordb-aof"] = {**ENGINES["falkordb"], "label": "FalkorDB (append-only file)",
+                           "port": port("falkordb-aof", 26380)}
 
 CITIES = ["Avonmere", "Brackwater", "Coldharbour", "Dunlow", "Eastwick", "Fennick", "Glenhollow", "Harrowgate"]
 UNITS = {"B": 1, "KB": 1e3, "KiB": 2**10, "MB": 1e6, "MiB": 2**20, "GB": 1e9, "GiB": 2**30}
@@ -205,7 +250,425 @@ class MemPeak(threading.Thread):
         self.join(timeout=5)
 
 
-WORKLOADS = ("bulk_load", "memory", "index_seek", "two_hop", "filtered_scan", "shortest_path",
+# --- Minimal clients -----------------------------------------------------------
+# A client library's own work is part of every latency it measures, and the
+# libraries differ: the official Neo4j driver does far more per query than a Redis
+# client does. With --client minimal every engine is driven by one of the two small
+# clients below, which do the least their protocol allows: send the statement and
+# its parameters, read the rows. Each offers the few calls of the Neo4j driver this
+# file uses, so every workload is the same code for every engine and client.
+
+class Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def data(self):
+        return self.rows
+
+    def single(self):
+        return self.rows[0] if self.rows else None
+
+    def consume(self):
+        return None
+
+
+class Connection:
+    """A TCP connection that a session owns for its lifetime."""
+
+    def __init__(self, address, connection_timeout):
+        # A connection opened with a timeout is a readiness probe: it must not wait
+        # for ever on a server that accepts the connection and then says nothing.
+        self.sock = socket.create_connection(address, timeout=connection_timeout or 30)
+        self.sock.settimeout(max(10, connection_timeout) if connection_timeout else None)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.reader = self.sock.makefile("rb")
+
+    def read(self, n):
+        data = self.reader.read(n)
+        if len(data) < n:
+            raise ConnectionError("the server closed the connection")
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.reader.close()
+        self.sock.close()
+
+
+class MinimalDriver:
+    def __init__(self, session, address, auth, default=None, connection_timeout=None, **_):
+        self.make, self.address, self.auth = session, address, auth
+        self.default, self.timeout = default, connection_timeout
+
+    def session(self, database=None):
+        return self.make(self.address, self.auth, database or self.default, self.timeout)
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+
+# FalkorDB speaks the Redis protocol. This sends what its client libraries send:
+# GRAPH.QUERY <graph> "CYPHER name=value ... <statement>" --compact.
+
+def cypher_literal(v):
+    """A parameter value as Cypher text, the way FalkorDB's clients pass parameters."""
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    if isinstance(v, (list, tuple)):
+        return "[" + ",".join(cypher_literal(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ",".join(f"{k}:{cypher_literal(x)}" for k, x in v.items()) + "}"
+    return repr(v)
+
+
+def compact_value(cell):
+    """One value of a --compact reply: [type, value]."""
+    kind, v = cell
+    if kind == 1:
+        return None
+    if kind == 4:
+        return v == "true"
+    if kind == 5:
+        return float(v)
+    if kind == 6:
+        return [compact_value(x) for x in v]
+    if kind == 10:
+        return {v[i]: compact_value(v[i + 1]) for i in range(0, len(v), 2)}
+    return v  # text and whole numbers arrive as they are
+
+
+class RespSession(Connection):
+    """One connection to one graph."""
+
+    def __init__(self, address, auth, graph, connection_timeout):
+        super().__init__(address, connection_timeout)
+        self.graph = graph
+
+    def command(self, *args):
+        parts = [b"*%d\r\n" % len(args)]
+        for a in args:
+            a = a if isinstance(a, bytes) else str(a).encode()
+            parts.append(b"$%d\r\n%s\r\n" % (len(a), a))
+        self.sock.sendall(b"".join(parts))
+        return self.reply()
+
+    def reply(self):
+        line = self.reader.readline()
+        if not line:
+            raise ConnectionError("the server closed the connection")
+        kind, rest = line[:1], line[1:-2]
+        if kind == b"+":
+            return rest.decode()
+        if kind == b"-":
+            raise RuntimeError(rest.decode())
+        if kind == b":":
+            return int(rest)
+        if kind == b"$":
+            return None if rest == b"-1" else self.read(int(rest) + 2)[:-2].decode()
+        if kind == b"*":
+            return [self.reply() for _ in range(int(rest))]
+        raise RuntimeError(f"unexpected reply {line!r}")
+
+    def run(self, statement, **params):
+        if params:
+            statement = "CYPHER " + " ".join(f"{k}={cypher_literal(v)}" for k, v in params.items()) + " " + statement
+        reply = self.command("GRAPH.QUERY", self.graph, statement, "--compact")
+        if len(reply) < 3:  # a statement that returns nothing answers with its statistics alone
+            return Rows([])
+        names = [h[1] for h in reply[0]]
+        return Rows([dict(zip(names, map(compact_value, row))) for row in reply[1]])
+
+
+# Bolt 5, for Galactus DB, Neo4j and Memgraph: one RUN and one PULL per statement,
+# as an auto-commit transaction, which is what the Neo4j driver's session.run sends.
+
+def pack(v):
+    """A value in PackStream, Bolt's encoding."""
+    if v is None:
+        return b"\xc0"
+    if v is True:
+        return b"\xc3"
+    if v is False:
+        return b"\xc2"
+    if isinstance(v, int):
+        if -16 <= v < 128:
+            return struct.pack(">b", v)
+        for marker, fmt, bits in ((0xC8, ">b", 7), (0xC9, ">h", 15), (0xCA, ">i", 31), (0xCB, ">q", 63)):
+            if -(1 << bits) <= v < (1 << bits):
+                return bytes([marker]) + struct.pack(fmt, v)
+    if isinstance(v, float):
+        return b"\xc1" + struct.pack(">d", v)
+    if isinstance(v, str):
+        data = v.encode()
+        return sized(len(data), 0x80, 0xD0) + data
+    if isinstance(v, (list, tuple)):
+        return sized(len(v), 0x90, 0xD4) + b"".join(map(pack, v))
+    if isinstance(v, dict):
+        return sized(len(v), 0xA0, 0xD8) + b"".join(pack(k) + pack(x) for k, x in v.items())
+    raise TypeError(f"cannot send {type(v).__name__} over Bolt")
+
+
+def sized(n, tiny, marker):
+    if n < 16:
+        return bytes([tiny + n])
+    if n < 256:
+        return bytes([marker, n])
+    return bytes([marker + 1]) + struct.pack(">H", n) if n < 65536 else bytes([marker + 2]) + struct.pack(">I", n)
+
+
+def unpack(data, at=0):
+    """One PackStream value from data, and the position after it."""
+    m = data[at]
+    at += 1
+    if m < 0x80:
+        return m, at
+    if m >= 0xF0:
+        return m - 256, at
+    if m == 0xC0:
+        return None, at
+    if m in (0xC2, 0xC3):
+        return m == 0xC3, at
+    if m == 0xC1:
+        return struct.unpack_from(">d", data, at)[0], at + 8
+    if 0xC8 <= m <= 0xCB:
+        fmt, size = ((">b", 1), (">h", 2), (">i", 4), (">q", 8))[m - 0xC8]
+        return struct.unpack_from(fmt, data, at)[0], at + size
+    if 0xB0 <= m <= 0xBF:  # a structure: its tag, then its fields
+        tag, at, fields = data[at], at + 1, []
+        for _ in range(m - 0xB0):
+            v, at = unpack(data, at)
+            fields.append(v)
+        return (tag, fields), at
+    for tiny, marker, kind in ((0x80, 0xD0, "text"), (0x90, 0xD4, "list"), (0xA0, 0xD8, "map"), (None, 0xCC, "bytes")):
+        if tiny is not None and tiny <= m < tiny + 16:
+            n = m - tiny
+        elif marker <= m <= marker + 2:
+            width = 1 << (m - marker)
+            n = int.from_bytes(data[at:at + width], "big")
+            at += width
+        else:
+            continue
+        if kind in ("text", "bytes"):
+            raw = bytes(data[at:at + n])
+            return (raw.decode() if kind == "text" else raw), at + n
+        items = []
+        for _ in range(n * (2 if kind == "map" else 1)):
+            v, at = unpack(data, at)
+            items.append(v)
+        return (dict(zip(items[::2], items[1::2])) if kind == "map" else items), at
+    raise RuntimeError(f"unexpected PackStream marker {m:#x}")
+
+
+HELLO, LOGON, RESET, RUN, PULL, SUCCESS, RECORD = 0x01, 0x6A, 0x0F, 0x10, 0x3F, 0x70, 0x71
+
+
+class BoltSession(Connection):
+    """One Bolt connection to one database."""
+
+    def __init__(self, address, auth, database, connection_timeout):
+        super().__init__(address, connection_timeout)
+        self.extra = {"db": database} if database else {}
+        # Offer Bolt 5.4 down to 5.0, then 4.4.
+        self.sock.sendall(b"\x60\x60\xb0\x17" + bytes([0, 4, 4, 5, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0]))
+        agreed = self.read(4)
+        self.version = (agreed[3], agreed[2])
+        if self.version < (4, 4):
+            raise ConnectionError(f"the server offered no Bolt version this client speaks: {agreed!r}")
+        hello = {"user_agent": "graph-benchmark/1.0"}
+        if self.version >= (5, 3):
+            hello["bolt_agent"] = {"product": "graph-benchmark/1.0"}
+        logon = {"scheme": "basic", "principal": auth[0], "credentials": auth[1]} if auth else {"scheme": "none"}
+        if self.version >= (5, 1):
+            self.sock.sendall(self.message(HELLO, hello) + self.message(LOGON, logon))
+            self.agent = self.expect_success().get("server")
+            self.expect_success()
+        else:
+            self.sock.sendall(self.message(HELLO, {**hello, **logon}))
+            self.agent = self.expect_success().get("server")
+
+    @staticmethod
+    def message(tag, *fields):
+        data = bytes([0xB0 + len(fields), tag]) + b"".join(map(pack, fields))
+        chunks = [struct.pack(">H", len(data[i:i + 65535])) + data[i:i + 65535] for i in range(0, len(data), 65535)]
+        return b"".join(chunks) + b"\x00\x00"
+
+    def receive(self):
+        parts = []
+        while True:
+            (n,) = struct.unpack(">H", self.read(2))
+            if n:
+                parts.append(self.read(n))
+            elif parts:  # an empty chunk ends a message; one on its own is a keep-alive
+                return unpack(b"".join(parts))[0]
+
+    def expect_success(self):
+        tag, fields = self.receive()
+        if tag != SUCCESS:
+            raise RuntimeError(self.failure(tag, fields))
+        return fields[0]
+
+    def failure(self, tag, fields, pending=0):
+        """Reads past the replies still owed, clears the failure, and describes it."""
+        for _ in range(pending):
+            self.receive()
+        self.sock.sendall(self.message(RESET))
+        self.receive()
+        info = fields[0] if fields else {}
+        return f"{info.get('code', f'reply {tag:#x}')}: {info.get('message', '')}"
+
+    def run(self, statement, **params):
+        self.sock.sendall(self.message(RUN, statement, params, self.extra) + self.message(PULL, {"n": -1}))
+        tag, fields = self.receive()
+        if tag != SUCCESS:
+            raise RuntimeError(self.failure(tag, fields, pending=1))
+        names, rows = fields[0].get("fields", []), []
+        while True:
+            tag, fields = self.receive()
+            if tag == RECORD:
+                rows.append(dict(zip(names, fields[0])))
+            elif tag == SUCCESS:
+                return Rows(rows)
+            else:
+                raise RuntimeError(self.failure(tag, fields))
+
+
+# --- The timed work ---------------------------------------------------------------
+# Everything that is timed is one of these jobs. They run in this process, or with
+# --inside in a container on the engine's own Docker network (see Worker), so that
+# no port forwarding sits between client and engine. A target says where the engine
+# is and which client reaches it.
+
+def open_driver(target, **kw):
+    auth = tuple(target["auth"]) if target["auth"] else None
+    address = (target["address"][0], target["address"][1])
+    if target["kind"] == "resp":
+        return MinimalDriver(RespSession, address, auth, target["database"], **kw)
+    if target["kind"] == "bolt":
+        return MinimalDriver(BoltSession, address, auth, **kw)
+    if GraphDatabase is None:
+        raise SystemExit("--client driver needs the Neo4j Python driver: pip install -r requirements.txt")
+    return GraphDatabase.driver("bolt://%s:%d" % address, auth=auth, **kw)
+
+
+def open_session(target, drv):
+    db = target["database"]
+    return drv.session() if db is None else drv.session(database=db)
+
+
+def job_load(target, nodes, rels, scale, batch):
+    """Creates the people, then the relationships, in batches on one session."""
+    with open_driver(target) as d, open_session(target, d) as s:
+        t0 = time.perf_counter()
+        for start in range(0, scale, batch):
+            s.run(nodes, rows=[person(i) for i in range(start, min(start + batch, scale))]).consume()
+        t_nodes = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        pairs = []
+        for r in knows(scale):
+            pairs.append(r)
+            if len(pairs) >= batch:
+                s.run(rels, pairs=pairs).consume()
+                pairs = []
+        if pairs:
+            s.run(rels, pairs=pairs).consume()
+        return {"nodes_s": t_nodes, "rels_s": time.perf_counter() - t1}
+
+
+def job_latency(target, statement, params, warm):
+    """Times each statement on one session; the first `warm` runs are not counted."""
+    lat, got = [], []
+    with open_driver(target) as d, open_session(target, d) as s:
+        for i, p in enumerate(params):
+            t0 = time.perf_counter()
+            rec = s.run(statement, **p).data()
+            dt_ = time.perf_counter() - t0
+            if i >= warm:
+                lat.append(dt_ * 1000)
+                got.append(rec)
+    return {"ms": lat, "records": got}
+
+
+def reader(target, statement, k, begin, seconds, seed, scale):
+    """One client of the concurrent phase: reads from `begin` until the window closes."""
+    rng, lat, end = random.Random(f"{seed}-read-{k}"), [], begin + seconds
+    with open_driver(target) as d, open_session(target, d) as s:
+        s.run(statement, id=rng.randrange(scale)).consume()  # connected before the window opens
+        time.sleep(max(0.0, begin - time.time()))
+        started = time.time()
+        if end - started < seconds / 2:
+            raise RuntimeError("a client process started too late to measure")
+        while time.time() < end:
+            t0 = time.perf_counter()
+            s.run(statement, id=rng.randrange(scale)).consume()
+            lat.append((time.perf_counter() - t0) * 1000)
+    return len(lat) / (end - started), lat
+
+
+def job_concurrent(target, statement, clients, seconds, seed, scale):
+    """Index lookups from several clients at once. Each client is its own process with its
+    own connection, so the clients do not queue for one Python interpreter."""
+    lead = 2 if multiprocessing.get_start_method() == "fork" else 3 + 0.3 * clients
+    begin = time.time() + lead
+    with multiprocessing.Pool(clients) as pool:
+        parts = pool.starmap(reader, [(target, statement, k, begin, seconds, seed, scale) for k in range(clients)],
+                             chunksize=1)
+    return {"per_s": sum(rate for rate, _ in parts), "p50_ms": pct([x for _, lat in parts for x in lat], 50)}
+
+
+JOBS = {"load": job_load, "latency": job_latency, "concurrent": job_concurrent}
+
+
+def serve():
+    """`bench.py --worker`: runs the jobs sent on standard input, one JSON line each."""
+    for line in sys.stdin:
+        req = json.loads(line)
+        try:
+            out = {"ok": JOBS[req["job"]](**req["args"])}
+        except Exception as e:
+            out = {"error": str(e)[:300] or type(e).__name__}
+        print(json.dumps(out), flush=True)
+
+
+class Worker:
+    """The jobs, run by `bench.py --worker` in the client container."""
+
+    def __init__(self, container):
+        self.proc = subprocess.Popen(
+            ["docker", "exec", "-i", container, "python", "-u", "/bench/bench.py", "--worker"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+
+    def call(self, job, **args):
+        self.proc.stdin.write(json.dumps({"job": job, "args": args}) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("the client container stopped answering")
+        out = json.loads(line)
+        if "error" in out:
+            raise RuntimeError(out["error"])
+        return out["ok"]
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+
+
+WORKLOADS = ("bulk_load", "memory", "round_trip", "index_seek", "two_hop", "filtered_scan", "shortest_path",
              "all_shortest_paths", "weighted_shortest_path", "concurrent_read", "restart")
 
 
@@ -218,18 +681,32 @@ class Run:
         # Only the selected workloads are recorded; the graph is always loaded first.
         self.sink = lambda row: sink(row) if row.get("workload") in self.keep else None
         self.rows = []
+        self.worker = None
 
     # -- plumbing -----------------------------------------------------------
     def q(self, name):
         return self.cfg.get("queries", {}).get(name, globals()[name])
 
+    def target(self, inside=False):
+        """Where the engine is and which client reaches it: from this machine by its published
+        port, or from the client container by its name on the Docker network."""
+        resp = self.cfg.get("protocol") == "resp"
+        return {"kind": "resp" if resp else "bolt" if self.a.client == "minimal" else "driver",
+                "address": [self.engine, 6379 if resp else 7687] if inside else ["127.0.0.1", self.cfg["port"]],
+                "auth": None if self.cfg["user"] is None else [self.cfg["user"], PASSWORD],
+                "database": self.cfg["database"]}
+
     def driver(self, **kw):
-        auth = None if self.cfg["user"] is None else (self.cfg["user"], PASSWORD)
-        return GraphDatabase.driver(self.cfg["uri"], auth=auth, **kw)
+        return open_driver(self.target(), **kw)
 
     def session(self, drv):
-        db = self.cfg["database"]
-        return drv.session() if db is None else drv.session(database=db)
+        return open_session(self.target(), drv)
+
+    def work(self, job, **args):
+        """Runs a timed job in this process or, with --inside, in the client container."""
+        if self.worker is None:
+            return JOBS[job](self.target(), **args)
+        return self.worker.call(job, target=self.target(inside=True), **args)
 
     def metric(self, workload, metric, value, unit, better, **extra):
         row = {"pass": self.pass_no, "engine": self.engine, "workload": workload,
@@ -247,25 +724,21 @@ class Run:
 
     def latency(self, workload, statement, params, key, warm):
         """Times each statement on one session; the first `warm` runs are not counted."""
-        lat, got = [], []
-        with self.session(self.drv) as s:
-            for i, p in enumerate(params):
-                t0 = time.perf_counter()
-                rec = s.run(statement, **p).data()
-                dt_ = time.perf_counter() - t0
-                if i >= warm:
-                    lat.append(dt_ * 1000)
-                    got.append(key(rec))
+        out = self.work("latency", statement=statement, params=params, warm=warm)
+        lat, got = out["ms"], [key(rec) for rec in out["records"]]
         self.metric(workload, "p50_ms", pct(lat, 50), "ms", "lower", p95_ms=pct(lat, 95), n=len(lat))
         self.metric(workload, "p95_ms", pct(lat, 95), "ms", "lower")
         self.answers(workload, got)
 
     # -- lifecycle -----------------------------------------------------------
     def start(self):
-        compose("--profile", self.engine, "down", "-v")
+        self.down()
         compose("--profile", self.engine, "up", "-d", self.engine)
         self.container = container_of(self.engine)
-        self.wait_bolt()
+        self.wait_ready()
+        if getattr(self.a, "inside", False):
+            compose("--profile", "client", "up", "-d", "client")
+            self.worker = Worker(container_of("client"))
         if self.cfg["setup"]:
             with self.driver() as d, d.session() as s:
                 for stmt in self.cfg["setup"]:
@@ -275,7 +748,7 @@ class Run:
             for stmt in self.cfg["schema"]:
                 s.run(stmt).consume()
 
-    def wait_bolt(self, timeout=600):
+    def wait_ready(self, timeout=600):
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -284,32 +757,26 @@ class Run:
                     return
             except Exception:
                 time.sleep(0.25)
-        raise SystemExit(f"{self.engine} did not accept Bolt connections within {timeout} s")
+        raise SystemExit(f"{self.engine} did not accept connections within {timeout} s")
 
     def stop(self):
         self.drv.close()
-        compose("--profile", self.engine, "down", "-v")
+        if self.worker:
+            self.worker.close()
+            self.worker = None
+        self.down()
+
+    def down(self):
+        compose("--profile", self.engine, "--profile", "client", "down", "-v")
 
     # -- workloads -------------------------------------------------------------
     def bulk_load(self, batch=1000):
         n = self.a.scale
-        with MemPeak(self.container) as mem, self.session(self.drv) as s:
-            t0 = time.perf_counter()
-            for start in range(0, n, batch):
-                s.run(self.q("Q_CREATE_NODES"), rows=[person(i) for i in range(start, min(start + batch, n))]).consume()
-            t_nodes = time.perf_counter() - t0
-            t1 = time.perf_counter()
-            pairs = []
-            for r in knows(n):
-                pairs.append(r)
-                if len(pairs) >= batch:
-                    s.run(self.q("Q_CREATE_RELS"), pairs=pairs).consume()
-                    pairs = []
-            if pairs:
-                s.run(self.q("Q_CREATE_RELS"), pairs=pairs).consume()
-            t_rels = time.perf_counter() - t1
-        self.metric("bulk_load", "nodes_per_s", n / t_nodes, "nodes/s", "higher")
-        self.metric("bulk_load", "rels_per_s", 2 * n / t_rels, "rels/s", "higher")
+        with MemPeak(self.container) as mem:
+            took = self.work("load", nodes=self.q("Q_CREATE_NODES"), rels=self.q("Q_CREATE_RELS"),
+                             scale=n, batch=batch)
+        self.metric("bulk_load", "nodes_per_s", n / took["nodes_s"], "nodes/s", "higher")
+        self.metric("bulk_load", "rels_per_s", 2 * n / took["rels_s"], "rels/s", "higher")
         self.metric("bulk_load", "peak_mem_mb", mem.peak / 1e6, "MB", "lower")
 
     def idle_memory(self, settle=15):
@@ -337,6 +804,11 @@ class Run:
         rng = random.Random(f"{self.a.seed}-{salt}")
         return [{"id": rng.randrange(self.a.scale)} for _ in range(count)]
 
+    def round_trip(self):
+        """An empty query: what the protocol, the client and the path to the engine cost."""
+        self.latency("round_trip", "RETURN 1 AS one", [{}] * (self.k(1000) + 50),
+                     lambda r: r[0]["one"] if r else None, warm=50)
+
     def index_seek(self):
         self.latency("index_seek", self.q("Q_SEEK"), self.ids("seek", self.k(1000) + 50),
                      lambda r: r[0]["name"] if r else None, warm=50)
@@ -358,55 +830,26 @@ class Run:
                      lambda r: [r[0]["hops"], r[0]["paths"]] if r else None, warm=10)
 
     def weighted_shortest_path(self):
-        project = self.q("Q_PROJECT")
+        project, built = self.q("Q_PROJECT"), 0.0
         if project:
             # Neo4j and Galactus DB answer weighted paths from a named projection,
-            # built once; Memgraph searches the stored graph directly.
-            with self.session(self.drv) as s:
-                t0 = time.perf_counter()
-                s.run(project).consume()
-                self.sink({"pass": self.pass_no, "engine": self.engine, "workload": "weighted_shortest_path",
-                           "kind": "projection", "ms": (time.perf_counter() - t0) * 1000})
+            # built once; Memgraph and FalkorDB search the stored graph directly.
+            built = self.work("latency", statement=project, params=[{}], warm=0)["ms"][0]
+        self.metric("weighted_shortest_path", "projection_ms", built, "ms", "lower")
         self.latency("weighted_shortest_path", self.q("Q_WSP"), self.pairs("wsp", self.k(100) + 10),
                      lambda r: round(float(r[0]["cost"]), 6) if r else None, warm=10)
 
     def concurrent_read(self):
-        clients, seconds = self.a.clients, self.a.seconds
-        counts, lats, stop = [0] * clients, [[] for _ in range(clients)], threading.Event()
-        errors = []
-
-        def worker(k):
-            rng = random.Random(f"{self.a.seed}-read-{k}")
-            try:
-                with self.session(self.drv) as s:
-                    while not stop.is_set():
-                        t0 = time.perf_counter()
-                        s.run(self.q("Q_SEEK"), id=rng.randrange(self.a.scale)).consume()
-                        lats[k].append((time.perf_counter() - t0) * 1000)
-                        counts[k] += 1
-            except Exception as e:
-                errors.append(e)
-                stop.set()
-
-        threads = [threading.Thread(target=worker, args=(k,)) for k in range(clients)]
         with MemPeak(self.container) as mem:
-            t0 = time.perf_counter()
-            for t in threads:
-                t.start()
-            time.sleep(seconds)
-            stop.set()
-            for t in threads:
-                t.join()
-            elapsed = time.perf_counter() - t0
-        if errors:
-            raise errors[0]
-        flat = [x for l in lats for x in l]
-        self.metric("concurrent_read", "reads_per_s", sum(counts) / elapsed, "reads/s", "higher", clients=clients)
-        self.metric("concurrent_read", "p50_ms", pct(flat, 50), "ms", "lower")
+            out = self.work("concurrent", statement=self.q("Q_SEEK"), clients=self.a.clients,
+                            seconds=self.a.seconds, seed=self.a.seed, scale=self.a.scale)
+        self.metric("concurrent_read", "reads_per_s", out["per_s"], "reads/s", "higher", clients=self.a.clients)
+        self.metric("concurrent_read", "p50_ms", out["p50_ms"], "ms", "lower")
         self.metric("concurrent_read", "peak_mem_mb", mem.peak / 1e6, "MB", "lower")
 
     def restart(self, stop_timeout=60):
-        """Clean stop, then time from `docker start` to the first correct answer."""
+        """Clean stop, then time from `docker start` to the first correct answer. Always asked
+        from this machine: a stopped container has no name on the Docker network to ask."""
         self.drv.close()
         sh("docker", "stop", "-t", str(stop_timeout), self.container, check=True)
         probe = self.a.scale - 1
@@ -435,7 +878,8 @@ class Run:
         return {"running": s.get("Running"), "oom_killed": s.get("OOMKilled"), "exit_code": s.get("ExitCode")}
 
     def attempt(self, workload, fn):
-        """Runs one workload. A failure is recorded as "did not finish" and the run goes on."""
+        """Runs one workload and says whether it finished. A failure is recorded as "did not
+        finish" and the run goes on."""
         kept = len(self.rows)
         try:
             fn()
@@ -452,20 +896,35 @@ class Run:
             if not st["running"]:
                 sh("docker", "start", self.container)
                 try:
-                    self.wait_bolt(timeout=300)
+                    self.wait_ready(timeout=300)
                 except SystemExit:
                     pass
             self.drv.close()
             self.drv = self.driver(max_connection_pool_size=self.a.clients + 8)
+            return False
+        return True
+
+    def skip(self, workload, reason):
+        """Records a workload that could not be run as did not finish."""
+        self.rows.append({"pass": self.pass_no, "engine": self.engine, "workload": workload,
+                          "metric": "did_not_finish", "value": 1, "unit": reason, "better": "lower"})
+        self.sink({"pass": self.pass_no, "engine": self.engine, "workload": workload,
+                   "kind": "failure", "reason": reason, "state": self.state()})
+        print(f"  {self.engine:13s} {workload:22s} DID NOT FINISH: {reason}")
 
     def all(self):
         self.start()
         try:
-            self.attempt("bulk_load", self.bulk_load)
-            if "memory" in self.keep:
-                self.attempt("memory", lambda: self.idle_memory(settle=2 if self.a.smoke else 15))
-            for name in WORKLOADS[2:]:
-                if name in self.keep:
+            loaded = self.attempt("bulk_load", self.bulk_load)
+            for name in WORKLOADS[1:]:
+                if name not in self.keep:
+                    continue
+                if not loaded:
+                    # Whatever the server holds is not the graph, so nothing timed on it counts.
+                    self.skip(name, "the graph did not load")
+                elif name == "memory":
+                    self.attempt("memory", lambda: self.idle_memory(settle=2 if self.a.smoke else 15))
+                else:
                     self.attempt(name, getattr(self, name))
         finally:
             self.stop()
@@ -486,8 +945,20 @@ def image_facts(image):
 def server_facts(engine):
     """Read back from the running server: version and the settings that matter."""
     cfg = ENGINES[engine]
-    r = Run(engine, argparse.Namespace(clients=1), 0, lambda row: None)
+    r = Run(engine, argparse.Namespace(clients=1, client="driver"), 0, lambda row: None)
     out = {}
+    if cfg.get("protocol") == "resp":
+        with r.driver() as d, r.session(d) as s:
+            module = next(dict(zip(m[::2], m[1::2])) for m in s.command("MODULE", "LIST") if "graph" in m)
+            redis = dict(l.split(":", 1) for l in s.command("INFO", "server").splitlines() if ":" in l)
+            ver = module["ver"]
+            out["version"] = f"{ver // 10000}.{ver // 100 % 100}.{ver % 100}"
+            out["agent"] = f"Redis {redis.get('redis_version')}, module graph"
+            out["protocol"] = "Redis protocol (RESP2), GRAPH.QUERY --compact"
+            out["settings"] = {k: v for k, v in s.command("GRAPH.CONFIG", "GET", "*")}
+            for name in ("save", "appendonly", "appendfsync", "maxmemory"):
+                out["settings"]["redis " + name] = s.command("CONFIG", "GET", name)[1]
+        return out
     with r.driver() as d, r.session(d) as s:
         info = s.run("RETURN 1").consume().server
         out["agent"], out["bolt"] = info.agent, ".".join(map(str, info.protocol_version))
@@ -533,13 +1004,15 @@ def host_facts():
     info = json.loads(sh("docker", "info", "--format", "{{json .}}") or "{}")
     return {
         "platform": platform.platform(), "processor": cpu_name(), "logical_cpus": os.cpu_count(),
-        "python": platform.python_version(), "neo4j_python_driver": neo4j.__version__,
+        "python": platform.python_version(), "neo4j_python_driver": neo4j.__version__ if neo4j else None,
         "docker": {k: info.get(k) for k in ("ServerVersion", "OperatingSystem", "KernelVersion", "NCPU", "MemTotal")},
         "other_running_containers": sh("docker", "ps", "--format", "{{.Names}} ({{.Image}})").splitlines(),
     }
 
 
 def main():
+    if sys.argv[1:] == ["--worker"]:
+        return serve()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engines", default=",".join(ENGINES), help="comma-separated: " + ", ".join(ENGINES))
     ap.add_argument("--scale", type=int, default=100_000, help="people in the graph; each knows two others")
@@ -547,6 +1020,10 @@ def main():
     ap.add_argument("--clients", type=int, default=16, help="clients in the concurrent read phase")
     ap.add_argument("--seconds", type=int, default=10, help="length of the concurrent read phase")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--client", choices=("driver", "minimal"), default="driver",
+                    help="driver: the official Neo4j Python driver for the Bolt engines. minimal: a small "
+                         "client in this file for every engine, so no client library's own work is measured. "
+                         "FalkorDB is always driven by the minimal client for its protocol")
     ap.add_argument("--smoke", action="store_true", help="few samples: prove every statement runs")
     ap.add_argument("--profiles", default="standard,restricted",
                     help="limit profiles to run: standard (8 CPUs, 4 GB), restricted (2 CPUs, 1 GB)")
@@ -556,7 +1033,13 @@ def main():
                     help="run only these workloads (comma-separated): " + ", ".join(WORKLOADS))
     ap.add_argument("--into", help="an earlier run folder: replace these engines' results for these "
                                    "workloads in it, and record which image re-measured them")
+    ap.add_argument("--inside", action="store_true",
+                    help="send the timed queries from a container on the engines' Docker network instead of "
+                         "from this machine, so no port forwarding sits between client and engine. Uses the "
+                         "minimal clients")
     a = ap.parse_args()
+    if a.inside:
+        a.client = "minimal"
     for wl in a.workloads or ():
         if wl not in WORKLOADS:
             raise SystemExit(f"unknown workload {wl!r}; choose from {', '.join(WORKLOADS)}")
@@ -590,6 +1073,8 @@ def run_profile(a, engines, profile, out):
            "bench_sha256": hashlib.sha256((HERE / "bench.py").read_bytes()).hexdigest(),
            "compose_sha256": hashlib.sha256((HERE / "docker-compose.yml").read_bytes()).hexdigest(),
            "host": host_facts(), "engines": {}}
+    if a.inside:
+        env["client_image"] = image_facts(os.environ.get("BENCH_CLIENT_IMAGE", "python:3.13-slim"))
     if env["host"]["other_running_containers"]:
         print("WARNING: other containers are running and will share the machine:",
               env["host"]["other_running_containers"])
