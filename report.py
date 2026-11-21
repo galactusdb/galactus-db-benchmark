@@ -13,7 +13,7 @@ import sys
 from collections import defaultdict
 
 HERE = pathlib.Path(__file__).resolve().parent
-ENGINE_ORDER = ["gdb-paged", "gdb-resident", "neo4j", "memgraph"]
+ENGINE_ORDER = ["gdb-paged", "gdb-resident", "neo4j", "memgraph", "falkordb", "falkordb-aof"]
 PROFILE_NAMES = {"standard": "Standard", "restricted": "Restricted"}
 
 # Each chart: (workload, metric, title, what it measures).
@@ -22,12 +22,14 @@ SECTIONS = [
         ("shortest_path", "p50_ms", "Shortest path", "Fewest hops between two people up to 6 hops apart. Median latency."),
         ("all_shortest_paths", "p50_ms", "All shortest paths", "Every equally short path between two people up to 6 hops apart. Median latency."),
         ("weighted_shortest_path", "p50_ms", "Weighted shortest path", "Lowest total weight between two random people (Dijkstra). Median latency."),
+        ("weighted_shortest_path", "projection_ms", "Weighted shortest path: preparation", "Building, once, the projection the weighted search runs on. Engines that search the stored graph build nothing."),
     ]),
     ("Lookups and traversals", [
+        ("round_trip", "p50_ms", "Round trip", "An empty query, RETURN 1: what the protocol, the client and the path to the engine cost before any work is done. Median latency."),
         ("index_seek", "p50_ms", "Index lookup", "One person by indexed id. Median latency."),
         ("two_hop", "p50_ms", "Two-hop traversal", "Distinct friends of friends of one person. Median latency."),
         ("filtered_scan", "p50_ms", "Filtered scan", "Count every person matching a predicate on an unindexed property. Median latency."),
-        ("concurrent_read", "reads_per_s", "Concurrent reads", "Index lookups per second from 16 clients at once."),
+        ("concurrent_read", "reads_per_s", "Concurrent reads", "Index lookups per second from 16 clients at once, each its own process and connection."),
     ]),
     ("Loading", [
         ("bulk_load", "nodes_per_s", "Bulk load: nodes", "People created per second, in batches of 1,000."),
@@ -48,7 +50,7 @@ def fmt(v, unit):
     if v is None:
         return "–"
     if unit == "ms":
-        return f"{v:.2f} ms" if v < 10 else f"{v:,.1f} ms"
+        return f"{v:.3f} ms" if v < 1 else f"{v:.2f} ms" if v < 10 else f"{v:,.1f} ms"
     if unit == "s":
         return f"{v:.2f} s" if v < 10 else f"{v:,.1f} s"
     if unit == "MB":
@@ -184,7 +186,8 @@ def setup(engines, env):
             f'<details class="engine"><summary><b>{html.escape(x["label"])}</b> '
             f'{html.escape(str(srv.get("version", "")))} · <code>{html.escape(x["image"]["image"])}</code></summary>'
             f'<p>Image digest <code>{html.escape(digest)}</code>, {x["image"].get("size_mb")} MB on disk. '
-            f'Bolt {html.escape(str(srv.get("bolt", "")))}. Limits: {x["limits"]["cpus"]:g} CPUs, '
+            f'{html.escape(srv.get("protocol") or "Bolt " + str(srv.get("bolt", "")))}. '
+            f'Limits: {x["limits"]["cpus"]:g} CPUs, '
             f'{x["limits"]["memory_bytes"] / 2**30:g} GiB.</p>'
             f'<p>Set-up: <code>{html.escape("; ".join(x["setup"] + x["schema"]))}</code></p>'
             f'<h5>Statements</h5><dl>{stmts}</dl>'
@@ -192,18 +195,31 @@ def setup(engines, env):
     h = env["host"]
     return (f'<h3>How it was run</h3><p class="host">Host: {html.escape(h["processor"] or h["platform"])}, '
             f'{h["logical_cpus"]} logical CPUs, Docker {html.escape(str(h["docker"]["ServerVersion"]))} on '
-            f'{html.escape(str(h["docker"]["OperatingSystem"]))}, Python {h["python"]} with the Neo4j Python '
-            f'driver {h["neo4j_python_driver"]}. Started {started(env["started"])}.</p>' + "".join(blocks))
+            f'{html.escape(str(h["docker"]["OperatingSystem"]))}, Python {h["python"]} with '
+            f'{client_text(env, h)}. Started {started(env["started"])}.</p>' + "".join(blocks))
+
+
+def client_text(env, host):
+    if env["params"].get("client") == "minimal":
+        where = ""
+        if env["params"].get("inside"):
+            image = (env.get("client_image") or {}).get("image", "a container")
+            where = f", run in a {image} container on each engine's Docker network"
+        return "the minimal clients in bench.py, one for Bolt and one for the Redis protocol" + where
+    text = f'the Neo4j Python driver {host["neo4j_python_driver"]}'
+    if "falkordb" in env["engines"]:
+        text += " for the Bolt engines and the minimal Redis-protocol client in bench.py for FalkorDB"
+    return text
 
 
 CSS = """
 :root{color-scheme:light;--bg:#f6f6f3;--surface:#fcfcfb;--line:#e2e1dc;--text:#0b0b0b;--muted:#52514e;
---s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--ok:#00791e;--bad:#c4302b;--accent:#2a78d6}
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#8a5cd6;--s6:#c2478f;--ok:#00791e;--bad:#c4302b;--accent:#2a78d6}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#111110;--surface:#1a1a19;
---line:#33332f;--text:#f0efec;--muted:#c3c2b7;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--ok:#4cc46a;
---bad:#ff7b72;--accent:#3987e5}}
+--line:#33332f;--text:#f0efec;--muted:#c3c2b7;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#9b72e8;--s6:#d65fa5;
+--ok:#4cc46a;--bad:#ff7b72;--accent:#3987e5}}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111110;--surface:#1a1a19;--line:#33332f;--text:#f0efec;--muted:#c3c2b7;
---s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--ok:#4cc46a;--bad:#ff7b72;--accent:#3987e5}
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#9b72e8;--s6:#d65fa5;--ok:#4cc46a;--bad:#ff7b72;--accent:#3987e5}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:1180px;margin:0 auto;padding:40px 16px 80px}h1{font-size:2rem;line-height:1.2;margin:0 0 8px}
@@ -223,6 +239,7 @@ border:1px solid var(--line);background:var(--surface);color:var(--text);border-
 .bar-name{grid-column:1/-1;font-size:.8rem;color:var(--muted)}.bar-track{min-width:0}
 .bar{display:block;height:14px;border-radius:0 4px 4px 0}.bar-value{font-size:.8rem;white-space:nowrap;font-variant-numeric:tabular-nums}
 .s1{background:var(--s1)}.s2{background:var(--s2)}.s3{background:var(--s3)}.s4{background:var(--s4)}
+.s5{background:var(--s5)}.s6{background:var(--s6)}
 .lead{font-size:.7rem;font-weight:600;color:var(--text);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:4px}
 .dnf{grid-column:1/-1;font-size:.78rem;color:var(--muted);font-style:italic}
 .check{font-size:.78rem;margin:12px 0 0}.check.ok{color:var(--ok)}.check.bad{color:var(--bad)}
@@ -267,6 +284,23 @@ def main():
                          for e in engines)
     legend = "".join(f'<li><i class="s{ENGINE_ORDER.index(e) + 1}"></i>{html.escape(first["engines"][e]["label"])}</li>'
                      for e in engines)
+    minimal = first["params"].get("client") == "minimal"
+    client = ("each engine driven by a minimal client for its own protocol" if minimal else
+              "the same Bolt driver for the Bolt engines")
+    if first["params"].get("inside"):
+        client += " from a container beside it on the same Docker network"
+    notes = []
+    if "neo4j" in engines:
+        notes.append("Neo4j's heap and page cache are the values <code>neo4j-admin server "
+                     "memory-recommendation</code> gives for each memory limit.")
+    if "falkordb" in engines:
+        notes.append("FalkorDB is a Redis module and is driven over the Redis protocol, with the command its "
+                     "client libraries send. Its image's 1 second query timeout is lifted so that every query "
+                     "can finish.")
+    if "falkordb-aof" in engines:
+        notes.append("FalkorDB keeps writes in memory between snapshots by default; it runs a second time with "
+                     "Redis's append-only file on, so that every write reaches a log on disk as it does in "
+                     "the other engines.")
     tabs = "".join(
         f'<button type="button" data-p="{p}" aria-pressed="{"true" if i == 0 else "false"}">{PROFILE_NAMES[p]}: '
         f'{envs[i]["limits"]["BENCH_CPUS"]} CPUs, {envs[i]["limits"]["BENCH_MEM"].upper().replace("G", " GB")}</button>'
@@ -275,12 +309,11 @@ def main():
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Graph database benchmark</title>
 <style>{CSS}</style></head><body><main>
 <h1>Graph database benchmark</h1>
-<p class="lede">{html.escape(versions)}. The same graph, the same Bolt driver and the same Cypher wherever every
+<p class="lede">{html.escape(versions)}. The same graph, {client} and the same Cypher wherever every
 engine accepts it, with each engine running alone under identical container limits. Bars show the median of the
 passes; hover or focus a bar for the range.</p>
 <p class="method">Galactus DB runs twice: Paged, its default engine, which keeps the pages in use in memory, and
-Resident, which keeps the whole graph in memory like Memgraph. Neo4j's heap and page cache are the values
-<code>neo4j-admin server memory-recommendation</code> gives for each memory limit. Every other setting is the
+Resident, which keeps the whole graph in memory. {" ".join(notes)} Every other setting is the
 engine's own default, and each server's effective settings are listed at the end.</p>
 <div class="tabs" role="group" aria-label="Container limits">{tabs}</div>
 <ul class="legend">{legend}</ul>

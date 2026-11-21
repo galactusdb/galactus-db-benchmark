@@ -1,4 +1,4 @@
-# Galactus DB, Neo4j and Memgraph, each under the same CPU and memory limits.
+# Galactus DB, Neo4j, Memgraph and FalkorDB, each under the same CPU and memory limits.
 #
 # bench.py starts one service at a time on a fresh volume, so the engines never
 # compete for the machine. Every engine runs its Community edition with its own
@@ -6,7 +6,8 @@
 #
 #   python bench.py            # runs everything, see README.md
 #
-# Limits come from the environment (or .env): BENCH_CPUS and BENCH_MEM.
+# Limits come from the environment (or .env): BENCH_CPUS and BENCH_MEM. If a host
+# port is taken on your machine, set its BENCH_PORT_ variable; bench.py reads the same.
 
 x-limits: &limits
   cpus: ${BENCH_CPUS:-8}
@@ -18,24 +19,24 @@ services:
   # memory inside one budget, and the database opens straight from disk.
   gdb-paged:
     <<: *limits
-    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.8}
+    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.5.3}
     profiles: [gdb-paged]
     environment:
       GDB_INITIAL_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}
       GDB_STORAGE_ENGINE: paged
-    ports: ["27687:7687"]
+    ports: ["${BENCH_PORT_GDB_PAGED:-27687}:7687"]
     volumes: [gdb-paged-data:/data]
 
   # Galactus DB with the Resident engine: the whole graph in memory, the
   # like-for-like engine for Memgraph. Everything else is the image default.
   gdb-resident:
     <<: *limits
-    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.1.8}
+    image: ianknowles/galactus-db:${GALACTUS_TAG:-2.5.3}
     profiles: [gdb-resident]
     environment:
       GDB_INITIAL_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}
       GDB_STORAGE_ENGINE: resident
-    ports: ["27690:7687"]
+    ports: ["${BENCH_PORT_GDB_RESIDENT:-27690}:7687"]
     volumes: [gdb-resident-data:/data]
 
   neo4j:
@@ -52,7 +53,7 @@ services:
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
       # Graph Data Science Community, for the weighted shortest path.
       NEO4J_PLUGINS: '["graph-data-science"]'
-    ports: ["27688:7687"]
+    ports: ["${BENCH_PORT_NEO4J:-27688}:7687"]
     volumes: [neo4j-data:/data]
 
   memgraph:
@@ -63,11 +64,49 @@ services:
     # log, periodic snapshots). Telemetry is switched off so the benchmark
     # machine sends nothing out; it does not affect the workload.
     command: ["--telemetry-enabled=false"]
-    ports: ["27689:7687"]
+    ports: ["${BENCH_PORT_MEMGRAPH:-27689}:7687"]
     volumes: [memgraph-data:/var/lib/memgraph]
+
+  falkordb:
+    <<: *limits
+    image: falkordb/falkordb-server:${FALKORDB_TAG:-6.0.4}
+    profiles: [falkordb]
+    # The image defaults are left in place: the graph in memory, a snapshot on
+    # Redis's save schedule and on a clean stop, and no append-only file. The
+    # image's own FALKORDB_ARGS are repeated here without its 1 second query
+    # timeout, so that every query can finish.
+    environment:
+      FALKORDB_ARGS: "MAX_QUEUED_QUERIES 25 RESULTSET_SIZE 10000"
+    ports: ["${BENCH_PORT_FALKORDB:-26379}:6379"]
+    volumes: [falkordb-data:/var/lib/falkordb/data]
+
+  # FalkorDB again with Redis's append-only file on, synced every second (the
+  # Redis default), so every write reaches a log on disk as it does in Galactus
+  # DB. Everything else is as above.
+  falkordb-aof:
+    <<: *limits
+    image: falkordb/falkordb-server:${FALKORDB_TAG:-6.0.4}
+    profiles: [falkordb-aof]
+    environment:
+      FALKORDB_ARGS: "MAX_QUEUED_QUERIES 25 RESULTSET_SIZE 10000"
+      REDIS_ARGS: "--appendonly yes"
+    ports: ["${BENCH_PORT_FALKORDB_AOF:-26380}:6379"]
+    volumes: [falkordb-aof-data:/var/lib/falkordb/data]
+
+  # With --inside, bench.py sends the timed queries from this container, which
+  # is on the same Docker network as the engine. It has no limits of its own,
+  # so the client is never what is being measured.
+  client:
+    image: ${BENCH_CLIENT_IMAGE:-python:3.13-slim}
+    profiles: [client]
+    init: true
+    command: ["sleep", "infinity"]
+    volumes: ["./:/bench:ro"]
 
 volumes:
   gdb-paged-data:
   gdb-resident-data:
   neo4j-data:
   memgraph-data:
+  falkordb-data:
+  falkordb-aof-data:
