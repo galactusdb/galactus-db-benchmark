@@ -13,7 +13,7 @@ import sys
 from collections import defaultdict
 
 HERE = pathlib.Path(__file__).resolve().parent
-ENGINE_ORDER = ["gdb-paged", "gdb-resident", "neo4j", "memgraph", "falkordb", "falkordb-aof", "arangodb"]
+ENGINE_ORDER = ["gdb-paged", "gdb-resident", "neo4j", "memgraph", "falkordb", "falkordb-aof", "arangodb", "dgraph"]
 PROFILE_NAMES = {"standard": "Standard", "restricted": "Restricted"}
 
 # Each chart: (workload, metric, title, what it measures).
@@ -205,23 +205,25 @@ def client_text(env, host):
         if env["params"].get("inside"):
             image = (env.get("client_image") or {}).get("image", "a container")
             where = f", run in a {image} container on each engine's Docker network"
-        return "the minimal clients in bench.py, one each for Bolt, the Redis protocol and HTTP" + where
+        return "the minimal clients in bench.py, one each for Bolt, the Redis protocol, HTTP and gRPC" + where
     text = f'the Neo4j Python driver {host["neo4j_python_driver"]}'
     if "falkordb" in env["engines"]:
         text += " for the Bolt engines and the minimal Redis-protocol client in bench.py for FalkorDB"
     if "arangodb" in env["engines"]:
         text += ", with the minimal HTTP client in bench.py for ArangoDB"
+    if "dgraph" in env["engines"]:
+        text += ", and the minimal gRPC client in bench.py for Dgraph"
     return text
 
 
 CSS = """
 :root{color-scheme:light;--bg:#f6f6f3;--surface:#fcfcfb;--line:#e2e1dc;--text:#0b0b0b;--muted:#52514e;
---s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#8a5cd6;--s6:#c2478f;--s7:#0e8c9c;--ok:#00791e;--bad:#c4302b;--accent:#2a78d6}
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#8a5cd6;--s6:#c2478f;--s7:#0e8c9c;--s8:#7a6a2a;--ok:#00791e;--bad:#c4302b;--accent:#2a78d6}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#111110;--surface:#1a1a19;
---line:#33332f;--text:#f0efec;--muted:#c3c2b7;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#9b72e8;--s6:#d65fa5;--s7:#2aaebf;
+--line:#33332f;--text:#f0efec;--muted:#c3c2b7;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#9b72e8;--s6:#d65fa5;--s7:#2aaebf;--s8:#c9b458;
 --ok:#4cc46a;--bad:#ff7b72;--accent:#3987e5}}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111110;--surface:#1a1a19;--line:#33332f;--text:#f0efec;--muted:#c3c2b7;
---s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#9b72e8;--s6:#d65fa5;--s7:#2aaebf;--ok:#4cc46a;--bad:#ff7b72;--accent:#3987e5}
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#9b72e8;--s6:#d65fa5;--s7:#2aaebf;--s8:#c9b458;--ok:#4cc46a;--bad:#ff7b72;--accent:#3987e5}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:1180px;margin:0 auto;padding:40px 16px 80px}h1{font-size:2rem;line-height:1.2;margin:0 0 8px}
@@ -241,7 +243,7 @@ border:1px solid var(--line);background:var(--surface);color:var(--text);border-
 .bar-name{grid-column:1/-1;font-size:.8rem;color:var(--muted)}.bar-track{min-width:0}
 .bar{display:block;height:14px;border-radius:0 4px 4px 0}.bar-value{font-size:.8rem;white-space:nowrap;font-variant-numeric:tabular-nums}
 .s1{background:var(--s1)}.s2{background:var(--s2)}.s3{background:var(--s3)}.s4{background:var(--s4)}
-.s5{background:var(--s5)}.s6{background:var(--s6)}.s7{background:var(--s7)}
+.s5{background:var(--s5)}.s6{background:var(--s6)}.s7{background:var(--s7)}.s8{background:var(--s8)}
 .lead{font-size:.7rem;font-weight:600;color:var(--text);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:4px}
 .dnf{grid-column:1/-1;font-size:.78rem;color:var(--muted);font-style:italic}
 .check{font-size:.78rem;margin:12px 0 0}.check.ok{color:var(--ok)}.check.bad{color:var(--bad)}
@@ -308,6 +310,11 @@ def main():
                      "HTTP API; the report lists every statement. It cannot see a container's limits, so it is "
                      "told the container's memory and cores through the variables its documentation gives for "
                      "containers, and sizes its caches from those.")
+    if "dgraph" in engines:
+        notes.append("Dgraph has no Cypher either, so it runs the same work in DQL, its own query language, "
+                     "over gRPC, which its own clients use: its HTTP API closes the connection after every "
+                     "request. Its two processes run in one container, its cache is half the container's "
+                     "memory, as Neo4j's heap is, and its durability is its default.")
     tabs = "".join(
         f'<button type="button" data-p="{p}" aria-pressed="{"true" if i == 0 else "false"}">{PROFILE_NAMES[p]}: '
         f'{envs[i]["limits"]["BENCH_CPUS"]} CPUs, {envs[i]["limits"]["BENCH_MEM"].upper().replace("G", " GB")}</button>'
