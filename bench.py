@@ -60,11 +60,12 @@ PASSWORD = os.environ.get("BENCH_PASSWORD", "benchmark-password-1")
 # page cache are what `neo4j-admin server memory-recommendation --memory=<mem>
 # --docker` prints for that memory, so the JVM is sized the way Neo4j advises.
 # ArangoDB is told the container's memory in bytes, since it cannot see the limit.
+# Dgraph's cache is half the container's memory, as Neo4j's heap is.
 PROFILES = {
     "standard": {"BENCH_CPUS": "8", "BENCH_MEM": "4g", "NEO4J_HEAP": "2g", "NEO4J_PAGECACHE": "512m",
-                 "ARANGODB_MEMORY": str(4 * 2**30)},
+                 "ARANGODB_MEMORY": str(4 * 2**30), "DGRAPH_CACHE_MB": "2048"},
     "restricted": {"BENCH_CPUS": "2", "BENCH_MEM": "1g", "NEO4J_HEAP": "307m", "NEO4J_PAGECACHE": "52m",
-                   "ARANGODB_MEMORY": str(2**30)},
+                   "ARANGODB_MEMORY": str(2**30), "DGRAPH_CACHE_MB": "512"},
 }
 LIMITS = dict(PROFILES["standard"])
 
@@ -215,7 +216,48 @@ ENGINES["arangodb"] = {
     "schema": ['POST /_db/bench/_api/index?collection=Person {"type": "persistent", "fields": ["id"]}'],
     "queries": AQL,
 }
-INNER_PORTS = {"bolt": 7687, "resp": 6379, "http": 8529}
+
+# Dgraph has no Cypher either: it is queried in DQL, its own language, over gRPC. Each
+# statement asks for the same work and returns the same answer, with the same parameter
+# and field names. People are nodes with an int index on id, and relationships are knows
+# edges with the weight as a facet, read in both directions through the reverse edge.
+# Loading uses two forms DgraphSession expands for each item of a parameter: "RDF FOR
+# rows:" sends one mutation of the template per row, and "UPSERT FOR pairs:" sends one
+# upsert block that looks up both ends of each pair by id, then links them.
+DQL_PATH = ("query q($a: int, $b: int) {{ A as var(func: eq(id, $a)) B as var(func: eq(id, $b)) "
+            "shortest(from: uid(A), to: uid(B){opts}) {{ knows{w} ~knows{w} }} }}")
+DQL = {
+    "Q_CREATE_NODES": ('RDF FOR rows: _:p{id} <dgraph.type> "Person" .\n_:p{id} <id> "{id}" .\n'
+                       '_:p{id} <name> "{name}" .\n_:p{id} <age> "{age}" .\n_:p{id} <city> "{city}" .'),
+    "Q_CREATE_RELS": ("UPSERT FOR pairs: a{n} as var(func: eq(id, {a})) b{n} as var(func: eq(id, {b})) "
+                      "| uid(a{n}) <knows> uid(b{n}) (w={w}) ."),
+    "Q_SEEK": "query q($id: int) { q(func: eq(id, $id)) { name } }",
+    "Q_SCAN": ("{ var(func: has(age)) { a as age  m as math(a % 7) } "
+               "q(func: uid(m)) @filter(eq(val(m), 0)) { c: count(uid) } }"),
+    "Q_TWO_HOP": "query q($id: int) { var(func: eq(id, $id)) { knows { f as knows } } q(func: uid(f)) { c: count(uid) } }",
+    # A shortest-path block answers with each path and its length or total weight
+    # (_weight_); the client returns them as hops, paths and cost. Dgraph has no
+    # all-shortest-paths: it is asked for the two shortest, which is the least that shows
+    # whether the shortest has a tie. No pair in this graph has more than one.
+    "Q_SP": DQL_PATH.format(opts=", depth: 6", w=""),
+    "Q_ASP": DQL_PATH.format(opts=", depth: 6, numpaths: 2", w=""),
+    "Q_PROJECT": None,
+    "Q_WSP": DQL_PATH.format(opts="", w=" @facets(w)"),
+    "Q_READY": "query q($id: int) { q(func: eq(id, $id)) { name } }",
+    "Q_ROUND_TRIP": "{ q(func: uid(0x1)) { one: count(uid) } }",
+}
+ENGINES["dgraph"] = {
+    "label": "Dgraph",
+    "protocol": "dgraph",
+    "port": port("dgraph", 29080),
+    # The image runs without users, and a server holds one graph.
+    "user": None,
+    "database": None,
+    "setup": ["ALTER name: string .\nage: int .\ncity: string .\nknows: [uid] @reverse ."],
+    "schema": ["ALTER id: int @index(int) ."],
+    "queries": DQL,
+}
+INNER_PORTS = {"bolt": 7687, "resp": 6379, "http": 8529, "dgraph": 9080}
 
 CITIES = ["Avonmere", "Brackwater", "Coldharbour", "Dunlow", "Eastwick", "Fennick", "Glenhollow", "Harrowgate"]
 UNITS = {"B": 1, "KB": 1e3, "KiB": 2**10, "MB": 1e6, "MiB": 2**20, "GB": 1e9, "GiB": 2**30}
@@ -607,9 +649,9 @@ class HttpSession(Connection):
             self.head += "Authorization: Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode() + "\r\n"
         self.base = f"/_db/{database or '_system'}"
 
-    def request(self, method, path, body=None):
-        data = b"" if body is None else json.dumps(body).encode()
-        self.sock.sendall(f"{method} {path} HTTP/1.1\r\n{self.head}Content-Type: application/json\r\n"
+    def request(self, method, path, body=None, content_type="application/json"):
+        data = b"" if body is None else body.encode() if isinstance(body, str) else json.dumps(body).encode()
+        self.sock.sendall(f"{method} {path} HTTP/1.1\r\n{self.head}Content-Type: {content_type}\r\n"
                           f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
         status = self.reader.readline().split(b" ", 2)
         if len(status) < 2:
@@ -656,6 +698,181 @@ class HttpSession(Connection):
         return Rows(rows)
 
 
+# Dgraph's own clients speak gRPC: protocol buffers over one long-lived HTTP/2
+# connection. (Its HTTP API closes the connection after every request, which would
+# charge Dgraph a new connection for every query.) This is the least of that protocol:
+# the HTTP/2 frames one call needs and the few protocol-buffer fields of Dgraph's
+# api.proto it uses, Query and Alter, sent as its clients send them.
+
+def varint(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def pb_bytes(field, data):
+    data = data.encode() if isinstance(data, str) else data
+    return varint(field << 3 | 2) + varint(len(data)) + data
+
+
+def pb_fields(data):
+    """The fields of a protocol-buffer message: {number: [values]}."""
+    at, out = 0, {}
+    while at < len(data):
+        key, at = read_varint(data, at)
+        field, kind = key >> 3, key & 7
+        if kind == 0:
+            value, at = read_varint(data, at)
+        elif kind == 2:
+            n, at = read_varint(data, at)
+            value, at = data[at:at + n], at + n
+        elif kind == 1:
+            value, at = data[at:at + 8], at + 8
+        elif kind == 5:
+            value, at = data[at:at + 4], at + 4
+        else:
+            raise RuntimeError(f"unexpected protocol-buffer wire type {kind}")
+        out.setdefault(field, []).append(value)
+    return out
+
+
+def read_varint(data, at):
+    n = shift = 0
+    while True:
+        b = data[at]
+        at += 1
+        n |= (b & 0x7F) << shift
+        shift += 7
+        if not b & 0x80:
+            return n, at
+
+
+H2_DATA, H2_HEADERS, H2_RST, H2_SETTINGS, H2_PING, H2_GOAWAY, H2_WINDOW = 0, 1, 3, 4, 6, 7, 8
+END_STREAM, END_HEADERS, ACK = 0x1, 0x4, 0x1
+BIG_WINDOW = 2**31 - 1
+
+
+class DgraphSession(Connection):
+    """One HTTP/2 connection carrying Dgraph's gRPC calls, one stream per call."""
+
+    def __init__(self, address, auth, database, connection_timeout):
+        super().__init__(address, connection_timeout)
+        self.authority = f"{address[0]}:{address[1]}".encode()
+        self.stream = -1
+        self.send_frame_size, self.stream_window_start = 16384, 65535
+        self.conn_window = 65535
+        # The preface, then settings that let the server send as much as it likes: a large
+        # window for each stream, and for the connection.
+        self.sock.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                          + self.frame(H2_SETTINGS, 0, 0, struct.pack(">HI", 0x4, BIG_WINDOW))
+                          + self.frame(H2_WINDOW, 0, 0, struct.pack(">I", BIG_WINDOW - 65535)))
+
+    @staticmethod
+    def frame(kind, flags, stream, payload=b""):
+        return struct.pack(">I", len(payload))[1:] + bytes([kind, flags]) + struct.pack(">I", stream) + payload
+
+    def read_frame(self):
+        head = self.read(9)
+        n = int.from_bytes(head[:3], "big")
+        kind, flags, stream = head[3], head[4], int.from_bytes(head[5:9], "big") & 0x7FFFFFFF
+        payload = self.read(n) if n else b""
+        if kind == H2_SETTINGS and not flags & ACK:
+            for i in range(0, len(payload), 6):
+                key, value = struct.unpack(">HI", payload[i:i + 6])
+                if key == 0x4:
+                    self.stream_window_start = value
+                elif key == 0x5:
+                    self.send_frame_size = value
+            self.sock.sendall(self.frame(H2_SETTINGS, ACK, 0))
+        elif kind == H2_PING and not flags & ACK:
+            self.sock.sendall(self.frame(H2_PING, ACK, 0, payload))
+        elif kind == H2_WINDOW:
+            grant = int.from_bytes(payload, "big") & 0x7FFFFFFF
+            if stream == 0:
+                self.conn_window += grant
+            elif stream == self.stream:
+                self.stream_window += grant
+        elif kind == H2_GOAWAY:
+            raise ConnectionError("the server closed the connection")
+        return kind, flags, stream, payload
+
+    def call(self, method, message):
+        """One unary gRPC call: the request message out, the response message back."""
+        self.stream += 2
+        stream, self.stream_window = self.stream, self.stream_window_start
+        path = b"/api.Dgraph/" + method.encode()
+        headers = (b"\x83\x86"                                   # :method POST, :scheme http
+                   + b"\x04" + bytes([len(path)]) + path          # :path
+                   + b"\x01" + bytes([len(self.authority)]) + self.authority
+                   + b"\x0f\x10\x10application/grpc"              # content-type
+                   + b"\x00\x02te\x08trailers")
+        self.sock.sendall(self.frame(H2_HEADERS, END_HEADERS, stream, headers))
+        body = b"\x00" + struct.pack(">I", len(message)) + message
+        while body:
+            room = min(self.send_frame_size, self.conn_window, self.stream_window)
+            if room <= 0:
+                self.read_frame()  # until the server grants more window
+                continue
+            chunk, body = body[:room], body[room:]
+            self.conn_window -= len(chunk)
+            self.stream_window -= len(chunk)
+            self.sock.sendall(self.frame(H2_DATA, 0 if body else END_STREAM, stream, chunk))
+        data = b""
+        while True:
+            kind, flags, on, payload = self.read_frame()
+            if on != stream:
+                continue
+            if kind == H2_RST:
+                raise RuntimeError("Dgraph reset the call")
+            if kind == H2_DATA:
+                if flags & 0x8:  # padded
+                    payload = payload[1:len(payload) - payload[0]]
+                data += payload
+            if kind in (H2_DATA, H2_HEADERS) and flags & END_STREAM:
+                break
+        if len(data) < 5:
+            # Trailers alone: Dgraph refused the call.
+            raise RuntimeError(f"Dgraph refused the {method} call")
+        return data[5:5 + int.from_bytes(data[1:5], "big")]
+
+    def query(self, query, variables=None, nquads=None):
+        req = pb_bytes(4, query) if query else b""
+        for k, v in (variables or {}).items():
+            req += pb_bytes(5, pb_bytes(1, "$" + k) + pb_bytes(2, str(v)))
+        if nquads is not None:
+            req += pb_bytes(12, pb_bytes(3, nquads)) + varint(13 << 3) + b"\x01"  # commit now
+        fields = pb_fields(self.call("Query", req))
+        return json.loads(fields[1][0]) if fields.get(1) and fields[1][0] else {}
+
+    def version(self):
+        return pb_fields(self.call("CheckVersion", b"")).get(1, [b""])[0].decode()
+
+    def run(self, statement, **params):
+        if statement.startswith("ALTER "):
+            self.call("Alter", pb_bytes(1, statement[6:]))
+            return Rows([])
+        if statement.startswith(("RDF FOR ", "UPSERT FOR ")):
+            kind, _, rest = statement.partition(" FOR ")
+            name, _, template = rest.partition(": ")
+            items = [{"n": n, **item} for n, item in enumerate(params[name])]
+            if kind == "RDF":
+                self.query(None, nquads="\n".join(template.format(**i) for i in items))
+            else:
+                find, _, link = template.partition(" | ")
+                self.query("query { " + " ".join(find.format(**i) for i in items) + " }",
+                           nquads="\n".join(link.format(**i) for i in items))
+            return Rows([])
+        data = self.query(statement, params)
+        if "_path_" in data:
+            weights = [p["_weight_"] for p in data["_path_"]]
+            least = min(weights)
+            return Rows([{"hops": least, "paths": weights.count(least), "cost": least}])
+        return Rows(data.get("q", []))
+
+
 # --- The timed work ---------------------------------------------------------------
 # Everything that is timed is one of these jobs. They run in this process, or with
 # --inside in a container on the engine's own Docker network (see Worker), so that
@@ -669,6 +886,8 @@ def open_driver(target, **kw):
         return MinimalDriver(RespSession, address, auth, target["database"], **kw)
     if target["kind"] == "http":
         return MinimalDriver(HttpSession, address, auth, **kw)
+    if target["kind"] == "dgraph":
+        return MinimalDriver(DgraphSession, address, auth, **kw)
     if target["kind"] == "bolt":
         return MinimalDriver(BoltSession, address, auth, **kw)
     if GraphDatabase is None:
@@ -868,7 +1087,7 @@ class Run:
         while time.time() < deadline:
             try:
                 with self.driver(connection_timeout=2) as d, d.session() as s:
-                    s.run("RETURN 1").consume()
+                    s.run(self.q("Q_ROUND_TRIP")).consume()
                     return
             except Exception:
                 time.sleep(0.25)
@@ -1073,6 +1292,17 @@ def server_facts(engine):
             out["settings"] = {k: v for k, v in s.command("GRAPH.CONFIG", "GET", "*")}
             for name in ("save", "appendonly", "appendfsync", "maxmemory"):
                 out["settings"]["redis " + name] = s.command("CONFIG", "GET", name)[1]
+        return out
+    if cfg.get("protocol") == "dgraph":
+        with r.driver() as d, d.session() as s:
+            tag = s.version()
+            out["version"], out["agent"] = tag.lstrip("v"), f"Dgraph {tag}"
+            out["protocol"] = "gRPC (HTTP/2, protocol buffers), DQL through Query and Alter"
+            out["settings"] = {}
+        # Alpha's flags as this container started it; anything not named is Dgraph's default.
+        args = json.loads(sh("docker", "inspect", "--format", "{{json .Config.Cmd}}", container_of(engine)) or "[]")
+        out["settings"]["command"] = " ".join(args)
+        out["settings"]["survive"] = "process (default)"
         return out
     if cfg.get("protocol") == "http":
         with r.driver() as d, d.session() as s:

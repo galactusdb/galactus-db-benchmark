@@ -1,4 +1,4 @@
-# Galactus DB, Neo4j, Memgraph, FalkorDB and ArangoDB, each under the same CPU and memory limits.
+# Galactus DB, Neo4j, Memgraph, FalkorDB, ArangoDB and Dgraph, each under the same CPU and memory limits.
 #
 # bench.py starts one service at a time on a fresh volume, so the engines never
 # compete for the machine. Every engine runs its Community edition with its own
@@ -110,6 +110,30 @@ services:
     ports: ["${BENCH_PORT_ARANGODB:-28529}:8529"]
     volumes: [arangodb-data:/var/lib/arangodb3]
 
+  # Dgraph, the official image. A single server is Dgraph's two processes, Zero (which
+  # coordinates) and Alpha (which holds the data and answers queries); they run in this
+  # one container, under one set of limits, as Dgraph's own standalone image runs them.
+  # That image's script does not pass on a stop signal, so a stop would kill both after
+  # the timeout; this one stops Alpha and then Zero cleanly. Alpha's cache is sized to
+  # half the container's memory, as Neo4j's heap is: its default is 4 GB, the whole of
+  # the standard limit. The address whitelist lets the client container set the schema,
+  # as the standalone image does. Durability is Dgraph's default (--survive process).
+  # Queries go to its gRPC port, which its own clients use: its HTTP API closes the
+  # connection after every request.
+  dgraph:
+    <<: *limits
+    image: dgraph/dgraph:${DGRAPH_TAG:-v25.5.1}
+    profiles: [dgraph]
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        dgraph zero --my=localhost:5080 & zero=$$!
+        dgraph alpha --my=localhost:7080 --zero=localhost:5080 --security "whitelist=0.0.0.0/0" --cache "size-mb=${DGRAPH_CACHE_MB:-2048}" & alpha=$$!
+        trap 'kill -TERM $$alpha; wait $$alpha; kill -TERM $$zero; wait $$zero; exit 0' TERM INT
+        wait $$alpha
+    ports: ["${BENCH_PORT_DGRAPH:-29080}:9080"]
+    volumes: [dgraph-data:/dgraph]
+
   # With --inside, bench.py sends the timed queries from this container, which
   # is on the same Docker network as the engine. It has no limits of its own,
   # so the client is never what is being measured.
@@ -128,3 +152,4 @@ volumes:
   falkordb-data:
   falkordb-aof-data:
   arangodb-data:
+  dgraph-data:
