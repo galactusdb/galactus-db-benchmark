@@ -1,9 +1,9 @@
-"""Galactus DB, Neo4j, Memgraph and FalkorDB, measured side by side.
+"""Galactus DB, Neo4j, Memgraph, FalkorDB and ArangoDB, measured side by side.
 
 Every engine gets the same machine, the same CPU and memory limits, the same
 synthetic graph and the same Cypher text wherever the engines accept it. The
 Bolt engines share one Python Bolt driver; FalkorDB is driven over its own
-Redis protocol. Engines run one at a time on a fresh volume, and the order
+Redis protocol, and ArangoDB runs the same work in AQL over HTTP. Engines run one at a time on a fresh volume, and the order
 rotates each pass so none always goes first or last.
 
 Usage:
@@ -20,6 +20,7 @@ Results go to runs/<timestamp>/ (or --out <folder>/<timestamp>/):
 Then run `python report.py` to build report.html from the newest results.
 """
 import argparse
+import base64
 import csv
 import datetime as dt
 import hashlib
@@ -58,9 +59,12 @@ PASSWORD = os.environ.get("BENCH_PASSWORD", "benchmark-password-1")
 # Container limits, identical for every engine within a profile. Neo4j's heap and
 # page cache are what `neo4j-admin server memory-recommendation --memory=<mem>
 # --docker` prints for that memory, so the JVM is sized the way Neo4j advises.
+# ArangoDB is told the container's memory in bytes, since it cannot see the limit.
 PROFILES = {
-    "standard": {"BENCH_CPUS": "8", "BENCH_MEM": "4g", "NEO4J_HEAP": "2g", "NEO4J_PAGECACHE": "512m"},
-    "restricted": {"BENCH_CPUS": "2", "BENCH_MEM": "1g", "NEO4J_HEAP": "307m", "NEO4J_PAGECACHE": "52m"},
+    "standard": {"BENCH_CPUS": "8", "BENCH_MEM": "4g", "NEO4J_HEAP": "2g", "NEO4J_PAGECACHE": "512m",
+                 "ARANGODB_MEMORY": str(4 * 2**30)},
+    "restricted": {"BENCH_CPUS": "2", "BENCH_MEM": "1g", "NEO4J_HEAP": "307m", "NEO4J_PAGECACHE": "52m",
+                   "ARANGODB_MEMORY": str(2**30)},
 }
 LIMITS = dict(PROFILES["standard"])
 
@@ -82,6 +86,34 @@ Q_WSP = ("MATCH (a:Person {id: $a}), (b:Person {id: $b}) "
          "CALL gds.shortestPath.dijkstra.stream('bench', {sourceNode: a, targetNode: b, "
          "relationshipWeightProperty: 'w'}) YIELD totalCost RETURN totalCost AS cost")
 Q_READY = "MATCH (p:Person {id: $id}) RETURN p.name AS name"
+Q_ROUND_TRIP = "RETURN 1 AS one"
+
+# ArangoDB has no Cypher: it is queried in AQL, its own language. Each statement below asks
+# for the same work and returns the same answer as the Cypher above, with the same names
+# for the parameters (@id is $id) and the returned fields. People are documents in a
+# Person collection and relationships are edges in a KNOWS edge collection.
+AQL_ONE = "FOR a IN Person FILTER a.id == @a FOR b IN Person FILTER b.id == @b "
+AQL = {
+    "Q_CREATE_NODES": "FOR r IN @rows INSERT {id: r.id, name: r.name, age: r.age, city: r.city} INTO Person",
+    "Q_CREATE_RELS": ("FOR p IN @pairs FOR a IN Person FILTER a.id == p.a FOR b IN Person FILTER b.id == p.b "
+                      "INSERT {_from: a._id, _to: b._id, w: p.w} INTO KNOWS"),
+    "Q_SEEK": "FOR p IN Person FILTER p.id == @id RETURN {name: p.name}",
+    "Q_SCAN": "FOR p IN Person FILTER p.age % 7 == 0 COLLECT WITH COUNT INTO c RETURN {c}",
+    # A traversal's default uniqueness (no edge twice on one path) is Cypher's.
+    "Q_TWO_HOP": ("FOR a IN Person FILTER a.id == @id "
+                  "RETURN {c: LENGTH(FOR c IN 2..2 OUTBOUND a KNOWS RETURN DISTINCT c._id)}"),
+    # SHORTEST_PATH and ALL_SHORTEST_PATHS take no hop limit, so the limit of 6 is applied
+    # to the answer. Every pair is chosen within 6 hops, so it never removes one.
+    "Q_SP": (AQL_ONE + "LET p = (FOR v IN ANY SHORTEST_PATH a TO b KNOWS RETURN 1) "
+             "FILTER LENGTH(p) > 1 AND LENGTH(p) <= 7 RETURN {hops: LENGTH(p) - 1}"),
+    "Q_ASP": (AQL_ONE + "LET ps = (FOR p IN ANY ALL_SHORTEST_PATHS a TO b KNOWS RETURN LENGTH(p.edges)) "
+              "FILTER LENGTH(ps) > 0 AND ps[0] <= 6 RETURN {hops: ps[0], paths: LENGTH(ps)}"),
+    "Q_PROJECT": None,
+    "Q_WSP": (AQL_ONE + "LET ws = (FOR v, e IN ANY SHORTEST_PATH a TO b KNOWS OPTIONS {weightAttribute: 'w'} "
+              "RETURN e.w) FILTER LENGTH(ws) > 0 RETURN {cost: SUM(ws)}"),
+    "Q_READY": "FOR p IN Person FILTER p.id == @id RETURN {name: p.name}",
+    "Q_ROUND_TRIP": "RETURN {one: 1}",
+}
 
 def port(engine, default):
     """The host port an engine is published on. If a default is taken on your machine, set
@@ -167,6 +199,23 @@ ENGINES = {
 # does in the other engines. Only loading and restarting differ from the entry above.
 ENGINES["falkordb-aof"] = {**ENGINES["falkordb"], "label": "FalkorDB (append-only file)",
                            "port": port("falkordb-aof", 26380)}
+ENGINES["arangodb"] = {
+    "label": "ArangoDB Community",
+    # ArangoDB answers AQL over HTTP with JSON: driven by a small client that posts each
+    # statement to its cursor API, as its client libraries do; see HttpSession below.
+    "protocol": "http",
+    "port": port("arangodb", 28529),
+    "user": "root",
+    "database": "bench",
+    # A database, a document collection and an edge collection are created through the
+    # HTTP API (AQL cannot create them), then a persistent index on id like the others'.
+    "setup": ['POST /_api/database {"name": "bench"}',
+              'POST /_db/bench/_api/collection {"name": "Person"}',
+              'POST /_db/bench/_api/collection {"name": "KNOWS", "type": 3}'],
+    "schema": ['POST /_db/bench/_api/index?collection=Person {"type": "persistent", "fields": ["id"]}'],
+    "queries": AQL,
+}
+INNER_PORTS = {"bolt": 7687, "resp": 6379, "http": 8529}
 
 CITIES = ["Avonmere", "Brackwater", "Coldharbour", "Dunlow", "Eastwick", "Fennick", "Glenhollow", "Harrowgate"]
 UNITS = {"B": 1, "KB": 1e3, "KiB": 2**10, "MB": 1e6, "MiB": 2**20, "GB": 1e9, "GiB": 2**30}
@@ -204,7 +253,7 @@ def pct(xs, p):
 
 
 def sh(*args, check=False):
-    r = subprocess.run(list(args), capture_output=True, text=True)
+    r = subprocess.run(list(args), capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and r.returncode != 0:
         raise SystemExit(f"{' '.join(args)} failed: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -544,6 +593,69 @@ class BoltSession(Connection):
                 raise RuntimeError(self.failure(tag, fields))
 
 
+# ArangoDB, over HTTP/1.1 with one kept-alive connection: each AQL statement is posted to
+# the database's cursor API with its parameters as bind variables, as ArangoDB's client
+# libraries do, and the rows come back in the reply.
+
+class HttpSession(Connection):
+    """One kept-alive HTTP connection to one database."""
+
+    def __init__(self, address, auth, database, connection_timeout):
+        super().__init__(address, connection_timeout)
+        self.head = f"Host: {address[0]}:{address[1]}\r\n"
+        if auth:
+            self.head += "Authorization: Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode() + "\r\n"
+        self.base = f"/_db/{database or '_system'}"
+
+    def request(self, method, path, body=None):
+        data = b"" if body is None else json.dumps(body).encode()
+        self.sock.sendall(f"{method} {path} HTTP/1.1\r\n{self.head}Content-Type: application/json\r\n"
+                          f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+        status = self.reader.readline().split(b" ", 2)
+        if len(status) < 2:
+            raise ConnectionError("the server closed the connection")
+        length, chunked = 0, False
+        while True:
+            line = self.reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+            name, _, value = line.decode("latin-1").partition(":")
+            name = name.strip().lower()
+            if name == "content-length":
+                length = int(value)
+            elif name == "transfer-encoding" and "chunked" in value.lower():
+                chunked = True
+        if chunked:
+            raw = b""
+            while True:
+                n = int(self.reader.readline().split(b";")[0], 16)
+                raw += self.read(n + 2)[:-2]
+                if n == 0:
+                    break
+        else:
+            raw = self.read(length) if length else b""
+        out = json.loads(raw) if raw else {}
+        if int(status[1]) >= 400:
+            raise RuntimeError(f"{int(status[1])} {out.get('errorNum', '')}: {out.get('errorMessage', raw[:200])}")
+        return out
+
+    def run(self, statement, **params):
+        method, _, rest = statement.partition(" ")
+        if method in ("GET", "POST", "PUT", "DELETE") and rest.startswith("/"):
+            # A call to the HTTP API itself, used only to set up the database.
+            path, _, body = rest.partition(" ")
+            return Rows([self.request(method, path, json.loads(body) if body else None)])
+        req = {"query": statement, "batchSize": 10000}
+        if params:
+            req["bindVars"] = params
+        out = self.request("POST", self.base + "/_api/cursor", req)
+        rows = out.get("result", [])
+        while out.get("hasMore"):
+            out = self.request("POST", f"{self.base}/_api/cursor/{out['id']}")
+            rows += out["result"]
+        return Rows(rows)
+
+
 # --- The timed work ---------------------------------------------------------------
 # Everything that is timed is one of these jobs. They run in this process, or with
 # --inside in a container on the engine's own Docker network (see Worker), so that
@@ -555,6 +667,8 @@ def open_driver(target, **kw):
     address = (target["address"][0], target["address"][1])
     if target["kind"] == "resp":
         return MinimalDriver(RespSession, address, auth, target["database"], **kw)
+    if target["kind"] == "http":
+        return MinimalDriver(HttpSession, address, auth, **kw)
     if target["kind"] == "bolt":
         return MinimalDriver(BoltSession, address, auth, **kw)
     if GraphDatabase is None:
@@ -690,9 +804,10 @@ class Run:
     def target(self, inside=False):
         """Where the engine is and which client reaches it: from this machine by its published
         port, or from the client container by its name on the Docker network."""
-        resp = self.cfg.get("protocol") == "resp"
-        return {"kind": "resp" if resp else "bolt" if self.a.client == "minimal" else "driver",
-                "address": [self.engine, 6379 if resp else 7687] if inside else ["127.0.0.1", self.cfg["port"]],
+        protocol = self.cfg.get("protocol", "bolt")
+        kind = protocol if protocol != "bolt" else "bolt" if self.a.client == "minimal" else "driver"
+        return {"kind": kind,
+                "address": [self.engine, INNER_PORTS[protocol]] if inside else ["127.0.0.1", self.cfg["port"]],
                 "auth": None if self.cfg["user"] is None else [self.cfg["user"], PASSWORD],
                 "database": self.cfg["database"]}
 
@@ -806,7 +921,7 @@ class Run:
 
     def round_trip(self):
         """An empty query: what the protocol, the client and the path to the engine cost."""
-        self.latency("round_trip", "RETURN 1 AS one", [{}] * (self.k(1000) + 50),
+        self.latency("round_trip", self.q("Q_ROUND_TRIP"), [{}] * (self.k(1000) + 50),
                      lambda r: r[0]["one"] if r else None, warm=50)
 
     def index_seek(self):
@@ -859,7 +974,7 @@ class Run:
         while True:
             try:
                 with self.driver(connection_timeout=1) as d, self.session(d) as s:
-                    rec = s.run(Q_READY, id=probe).single()
+                    rec = s.run(self.q("Q_READY"), id=probe).single()
                     if rec and rec["name"] == want:
                         break
             except Exception:
@@ -959,6 +1074,22 @@ def server_facts(engine):
             for name in ("save", "appendonly", "appendfsync", "maxmemory"):
                 out["settings"]["redis " + name] = s.command("CONFIG", "GET", name)[1]
         return out
+    if cfg.get("protocol") == "http":
+        with r.driver() as d, d.session() as s:
+            v = s.request("GET", "/_api/version?details=true")
+            out["version"], out["edition"] = v["version"], v.get("license")
+            out["agent"] = f"ArangoDB {v['version']} ({v['details'].get('mode', '')})"
+            out["protocol"] = "HTTP/1.1 with JSON, AQL through the cursor API"
+            out["settings"] = {"ARANGODB_OVERRIDE_DETECTED_TOTAL_MEMORY": LIMITS.get("ARANGODB_MEMORY"),
+                               "ARANGODB_OVERRIDE_DETECTED_NUMBER_OF_CORES": LIMITS.get("BENCH_CPUS")}
+        # The options API is closed to password logins, so the values are read from arangod in the
+        # same container, which computes them from the same detected memory and cores. Nothing
+        # in the configuration file sets any of them.
+        opts = json.loads(sh("docker", "exec", container_of(engine), "arangod", "--dump-options") or "{}")
+        out["settings"].update({k: opts[k]["default"] for k in sorted(opts) if k in (
+            "rocksdb.sync-interval", "rocksdb.block-cache-size", "rocksdb.total-write-buffer-size",
+            "cache.size", "query.memory-limit", "query.global-memory-limit")})
+        return out
     with r.driver() as d, r.session(d) as s:
         info = s.run("RETURN 1").consume().server
         out["agent"], out["bolt"] = info.agent, ".".join(map(str, info.protocol_version))
@@ -1023,7 +1154,7 @@ def main():
     ap.add_argument("--client", choices=("driver", "minimal"), default="driver",
                     help="driver: the official Neo4j Python driver for the Bolt engines. minimal: a small "
                          "client in this file for every engine, so no client library's own work is measured. "
-                         "FalkorDB is always driven by the minimal client for its protocol")
+                         "FalkorDB and ArangoDB are always driven by the minimal client for their protocol")
     ap.add_argument("--smoke", action="store_true", help="few samples: prove every statement runs")
     ap.add_argument("--profiles", default="standard,restricted",
                     help="limit profiles to run: standard (8 CPUs, 4 GB), restricted (2 CPUs, 1 GB)")
@@ -1127,8 +1258,11 @@ def merge_profile(a, engines, profile, out):
     if not (out / "environment.json").exists():
         raise SystemExit(f"no earlier run in {out}")
     env = json.loads((out / "environment.json").read_text(encoding="utf-8"))
-    if env["limits"] != LIMITS:
+    if any(env["limits"].get(k, v) != v for k, v in LIMITS.items()):  # runs before a setting existed lack it
         raise SystemExit(f"{out} ran under {env['limits']}, not {LIMITS}")
+    for key in ("scale", "client", "inside", "clients", "seconds", "seed"):
+        if key in env["params"] and env["params"][key] != getattr(a, key):
+            raise SystemExit(f"{out} ran with --{key} {env['params'][key]}, not {getattr(a, key)}")
     workloads = a.workloads or list(WORKLOADS)
     replaced = {(e, w) for e in engines for w in workloads}
 
@@ -1149,6 +1283,14 @@ def merge_profile(a, engines, profile, out):
 
         for e in engines:
             facts = engine_facts(Run(e, a, 0, sink))
+            if e not in env["engines"]:
+                # An engine the earlier run did not have joins it, measured under the same limits.
+                if any(facts["limits"] != v["limits"] for v in env["engines"].values()):
+                    raise SystemExit(f"{e} limits differ from the earlier run")
+                env["engines"][e] = {**facts, "added": {
+                    "at": dt.datetime.now().isoformat(timespec="seconds"), "workloads": workloads,
+                    "passes": a.passes, "bench_sha256": hashlib.sha256((HERE / "bench.py").read_bytes()).hexdigest()}}
+                continue
             if facts["limits"] != env["engines"][e]["limits"]:
                 raise SystemExit(f"{e} limits differ from the earlier run")
             env["engines"][e].setdefault("remeasured", []).append({

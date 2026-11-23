@@ -1,4 +1,4 @@
-# Galactus DB, Neo4j, Memgraph and FalkorDB, each under the same CPU and memory limits.
+# Galactus DB, Neo4j, Memgraph, FalkorDB and ArangoDB, each under the same CPU and memory limits.
 #
 # bench.py starts one service at a time on a fresh volume, so the engines never
 # compete for the machine. Every engine runs its Community edition with its own
@@ -93,6 +93,23 @@ services:
     ports: ["${BENCH_PORT_FALKORDB_AOF:-26380}:6379"]
     volumes: [falkordb-aof-data:/var/lib/falkordb/data]
 
+  # ArangoDB Community, the official image with its defaults: RocksDB storage with
+  # its write-ahead log synced in the background.
+  arangodb:
+    <<: *limits
+    image: arangodb:${ARANGODB_TAG:-3.12.13}
+    profiles: [arangodb]
+    environment:
+      ARANGO_ROOT_PASSWORD: ${BENCH_PASSWORD:-benchmark-password-1}
+      # ArangoDB sizes its caches and query limits from the memory and cores it
+      # detects, and inside a container it can see the whole host. These are the
+      # variables its documentation gives for containers, set to the container's
+      # own limits, so it sizes itself for the machine it is given.
+      ARANGODB_OVERRIDE_DETECTED_TOTAL_MEMORY: ${ARANGODB_MEMORY:-4294967296}
+      ARANGODB_OVERRIDE_DETECTED_NUMBER_OF_CORES: ${BENCH_CPUS:-8}
+    ports: ["${BENCH_PORT_ARANGODB:-28529}:8529"]
+    volumes: [arangodb-data:/var/lib/arangodb3]
+
   # With --inside, bench.py sends the timed queries from this container, which
   # is on the same Docker network as the engine. It has no limits of its own,
   # so the client is never what is being measured.
@@ -110,3 +127,4 @@ volumes:
   memgraph-data:
   falkordb-data:
   falkordb-aof-data:
+  arangodb-data:

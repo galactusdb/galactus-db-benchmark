@@ -1,6 +1,6 @@
 # Graph database benchmark
 
-Galactus DB, Neo4j, Memgraph and FalkorDB, measured side by side on your own machine. One
+Galactus DB, Neo4j, Memgraph, FalkorDB and ArangoDB, measured side by side on your own machine. One
 command runs every engine through the same workloads, writes the results as CSV
 and builds a single HTML page of charts.
 
@@ -11,8 +11,8 @@ python report.py         # writes runs/<run>/report.html
 ```
 
 You need Docker with Compose and Python 3.9 or later. The first run pulls the images:
-Galactus DB, Neo4j Community (with the Graph Data Science plugin), Memgraph Community
-and FalkorDB.
+Galactus DB, Neo4j Community (with the Graph Data Science plugin), Memgraph Community,
+FalkorDB and ArangoDB Community.
 
 ## How the comparison is kept fair
 
@@ -33,8 +33,12 @@ and FalkorDB.
   for each memory limit, Neo4j loads the Graph Data Science plugin for weighted
   paths, and Memgraph's telemetry is off. FalkorDB runs its server image as it
   comes, without the image's 1 second query timeout so that every query can
-  finish. Each server's effective settings are read back from the running
-  server and printed in the report.
+  finish. ArangoDB sizes its caches from the memory and cores it detects, and
+  inside a container it sees the whole host, so it is told the container's
+  limits through `ARANGODB_OVERRIDE_DETECTED_TOTAL_MEMORY` and
+  `ARANGODB_OVERRIDE_DETECTED_NUMBER_OF_CORES`, the variables its documentation
+  gives for containers. Each server's effective settings are read back from the
+  running server and printed in the report.
 - **Same data, same Cypher.** The graph is generated from a fixed seed: 100,000
   people, each knowing two others, with a weight of 1 to 10 on every
   relationship. Every engine runs the same statement text wherever it accepts
@@ -43,9 +47,11 @@ and FalkorDB.
 - **Like-for-like clients.** One Python process drives every engine. Galactus
   DB, Neo4j and Memgraph speak Bolt and share the official Neo4j Python driver.
   FalkorDB is a Redis module, so it is driven over the Redis protocol by a small
-  client in `bench.py` that sends what FalkorDB's own clients send. A client
+  client in `bench.py` that sends what FalkorDB's own clients send. ArangoDB
+  answers over HTTP, so it is driven by a small HTTP client in `bench.py` that
+  posts each statement to its cursor API, as ArangoDB's own clients do. A client
   library's work is part of every latency it measures, and the Neo4j driver does
-  far more per query than a Redis client, so to compare engines across the two
+  far more per query than a Redis client, so to compare engines across
   protocols run with `--client minimal`: every engine is then driven by a small
   client that only sends the statement and reads the rows.
 - **The client beside the engine.** With `--inside`, the timed queries are sent
@@ -58,8 +64,8 @@ and FalkorDB.
 - **Clients that do not queue.** In the concurrent test each of the 16 clients
   is its own process with its own connection, so the test measures the engine
   and not one Python interpreter.
-- **Like-for-like durability.** Galactus DB, Neo4j and Memgraph log every write
-  to disk by default. FalkorDB keeps writes in memory between snapshots unless
+- **Like-for-like durability.** Galactus DB, Neo4j, Memgraph and ArangoDB log
+  every write to disk by default. FalkorDB keeps writes in memory between snapshots unless
   Redis's append-only file is on, so it runs twice: as it comes (`falkordb`),
   and with the append-only file on (`falkordb-aof`).
 - **The same answers.** Every timed query's answer is fingerprinted, and the
@@ -111,6 +117,14 @@ FalkorDB takes `shortestPath()` in a `WITH` clause and `allShortestPaths()` once
 both ends are bound, so those two statements are reworded for it, and it answers
 weighted paths with its own `algo.SPpaths` procedure.
 
+ArangoDB has no Cypher, so every statement is written in AQL, its own query
+language, asking for the same work and returning the same answer: people are
+documents in a `Person` collection with a persistent index on `id`, and
+relationships are edges in a `KNOWS` edge collection. Paths use its built-in
+`SHORTEST_PATH` and `ALL_SHORTEST_PATHS`, with `weightAttribute` for weighted
+paths. Those take no hop limit, so the 6-hop limit is applied to the answer;
+every pair is chosen within 6 hops, so it never removes one.
+
 ## Options
 
 ```sh
@@ -133,7 +147,7 @@ python bench.py --engines gdb-paged,gdb-resident --workloads weighted_shortest_p
 ```
 
 Image versions are pinned in `docker-compose.yml` and can be changed with
-`GALACTUS_TAG`, `NEO4J_TAG`, `MEMGRAPH_TAG` and `FALKORDB_TAG`; the client
+`GALACTUS_TAG`, `NEO4J_TAG`, `MEMGRAPH_TAG`, `FALKORDB_TAG` and `ARANGODB_TAG`; the client
 container's image is `BENCH_CLIENT_IMAGE`. If a host port is taken on your
 machine, set `BENCH_PORT_` and the engine's name, as in
 `BENCH_PORT_GDB_RESIDENT`.
